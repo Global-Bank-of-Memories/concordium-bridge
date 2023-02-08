@@ -1,0 +1,24 @@
+[package]
+name = "bom_concordium"
+version = "0.1.0"
+authors = []
+edition = "2018"
+license = "APACHE-2.0"
+
+[features]
+default = ["std", "crypto-primitives"]
+crypto-primitives = ["concordium-std/crypto-primitives"]
+std = ["concordium-std/std", "concordium-cis2/std"]
+
+[dependencies]
+wgbm_shared = {path="../shared"}
+concordium-std = "5.1"
+concordium-cis2 = "2.0"
+
+[lib]
+crate-type=["cdylib", "rlib"]
+
+[profile.release]
+opt-level = "s"
+codegen-units = 1
+

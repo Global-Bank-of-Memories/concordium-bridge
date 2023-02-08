@@ -1,0 +1,16 @@
+[package]
+name = "wgbm_shared"
+version = "0.1.0"
+authors = []
+edition = "2018"
+license = "APACHE-2.0"
+
+[dependencies]
+concordium-std = "5.1"
+
+[lib]
+crate-type=["cdylib", "rlib"]
+
+[profile.release]
+opt-level = "s"
+codegen-units = 1
