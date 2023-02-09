@@ -156,7 +156,16 @@ struct ReturnBasicState {
     validators: Vec<[u8; 33]>,
     /// Minimum number of validators should sign withdrawal operation
     validators_required: u8,
+    // Validators set version
+    version: u32,
 }
+
+#[derive(Serialize, SchemaType)]
+struct ReturnWithdrawHash {
+    /// Generated hash for withdraw
+    hash: [u8; 32],
+}
+
 
 /// The parameter type for the contract function `setPaused`.
 #[derive(Serialize, SchemaType)]
@@ -349,8 +358,10 @@ enum ContractError {
     /// Invalid number of required validators to sign operation.
     InvalidCountOFValidatorsRequired,
     /// Signed Withdrawal is already executed
-    WithdrawalIsAlreadyExecuted,
-    /// Signed Withdrawal operation is not valid anymore.
+    DuplicateWithdrawRequested,
+    // Withdrawal amount is zero
+    WithdrawAmountIsZero,
+    /// Signed Withdrawal operation is expired.
     WithdrawalIsExpired,
     /// Signed Withdrawal operation refers to invalid validator index
     InvalidValidatorIndex,
@@ -359,9 +370,11 @@ enum ContractError {
     /// Number of Signatures & Validator Indexes are not same
     InvalidNumberOfSignaturesAndIndexes,
     /// Number of supplied signatures is less than required minimum number of signatures
-    NotEnoughSignaturesSupplied,
+    IncorrectNumberOfSignaturesSupplied,
     /// Validator signature is invalid
     InvalidSignature,
+    /// Requested deposit amount is zero
+    DepositAmountIsZero,
 }
 
 type ContractResult<A> = Result<A, ContractError>;
@@ -432,8 +445,10 @@ impl<S: HasStateApi> State<S> {
         &mut self,
         validator: [u8; 33],
     ) {
-        self.validators.push(validator);
-        self.version += 1;
+        if ! self.validators.contains(&validator) {
+            self.validators.push(validator);
+            self.version += 1;
+        }
     }
 
     /// Update the state removing an operator for a given token id and address.
@@ -443,11 +458,10 @@ impl<S: HasStateApi> State<S> {
         for i in 0..self.validators.len() {
             if self.validators[i].eq(validator) {
                 self.validators.remove(i);
+                self.version += 1;
                 break;
             }
         }
-
-        self.version += 1;
     }
 
     /// Check if state contains any implementors for a given standard.
@@ -466,6 +480,37 @@ impl<S: HasStateApi> State<S> {
         implementors: Vec<ContractAddress>,
     ) {
         self.implementors.insert(std_id, implementors);
+    }
+
+    fn withdraw_hash(
+        &self,
+        id: [u8; 32],
+        address: Address,
+        amount: u64,
+        expiration: u64,
+        crypto_primitives: &impl HasCryptoPrimitives
+    ) -> HashKeccak256 {
+        let mut message: Vec<u8> = vec![];
+
+        message.extend(self.version.to_le_bytes());
+        message.extend(id);
+
+        match address {
+            Address::Account(address) => {
+                message.extend([1u8; 1]);
+                message.extend(address.0);
+            },
+            Address::Contract(contract) => {
+                message.extend([2u8; 1]);
+                message.extend(contract.index.to_le_bytes());
+                message.extend(contract.subindex.to_le_bytes());
+            }
+        }
+
+        message.extend(amount.to_le_bytes());
+        message.extend(expiration.to_le_bytes());
+
+        crypto_primitives.hash_keccak_256(message.as_slice())
     }
 }
 
@@ -508,6 +553,39 @@ fn contract_init<S: HasStateApi>(
     Ok(state)
 }
 
+/// Function to view the basic state of the contract.
+#[receive(
+contract = "gbm_Bridge",
+name = "withdraw_hash",
+parameter = "WithdrawParams",
+return_value = "ReturnWithdrawHash",
+error = "ContractError",
+crypto_primitives
+)]
+fn contract_withdraw_hash<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &impl HasHost<State<S>, StateApiType=S>,
+    crypto_primitives: &impl HasCryptoPrimitives,
+) -> ContractResult<ReturnWithdrawHash> {
+    // Parse the parameter.
+    let params: WithdrawParams = ctx.parameter_cursor().get()?;
+
+    let hash = host.state().withdraw_hash(
+        params.id,
+        params.to,
+        params.amount,
+        params.expiration,
+        crypto_primitives,
+    );
+
+    Ok(
+        ReturnWithdrawHash {
+            hash: hash.0
+        }
+    )
+}
+
+
 /// Wrap an amount of CCD into wGBM tokens and transfer the tokens if the sender
 /// is not the receiver.
 #[receive(
@@ -532,31 +610,20 @@ fn contract_withdraw<S: HasStateApi>(
     // Parse the parameter.
     let params: WithdrawParams = ctx.parameter_cursor().get()?;
 
+    ensure!(params.amount > 0, ContractError::WithdrawAmountIsZero);
     ensure!(params.expiration > ctx.metadata().slot_time().timestamp_millis(), ContractError::WithdrawalIsExpired);
     ensure!(params.signatures.len() == params.indexes.len(), ContractError::InvalidNumberOfSignaturesAndIndexes);
-    ensure!(params.signatures.len() >= host.state().validators_required.into(), ContractError::NotEnoughSignaturesSupplied);
+    ensure!(params.signatures.len() >= host.state().validators_required.into(), ContractError::IncorrectNumberOfSignaturesSupplied);
 
-    ensure!(host.state().is_executed_withdrawal_request(&params.id), ContractError::WithdrawalIsAlreadyExecuted);
+    ensure!(!host.state().is_executed_withdrawal_request(&params.id), ContractError::DuplicateWithdrawRequested);
 
-    let mut message: Vec<u8> = vec![];
-
-    message.extend(host.state().version.to_le_bytes());
-    message.extend(params.id.to_vec());
-
-    match params.to {
-        Address::Account(address) => {
-            message.extend(address.0);
-        },
-        Address::Contract(contract) => {
-            message.extend(contract.index.to_le_bytes());
-            message.extend(contract.subindex.to_le_bytes());
-        }
-    }
-
-    message.extend(params.amount.to_le_bytes());
-    message.extend(params.expiration.to_le_bytes());
-
-    let hash = crypto_primitives.hash_keccak_256(message.as_slice());
+    let hash = host.state().withdraw_hash(
+        params.id,
+        params.to,
+        params.amount,
+        params.expiration,
+        crypto_primitives,
+    );
 
     let mut processed_validators: Vec<u8> = vec![];
 
@@ -600,7 +667,7 @@ fn contract_withdraw<S: HasStateApi>(
         &mint_parameter,
         EntrypointName::new_unchecked("mint"),
         Amount::zero(),
-    ).unwrap_abort();
+    )?;
 
     // Log withdrawal.
     logger.log(&BridgeEvent::Withdraw(WithdrawEvent {
@@ -633,6 +700,8 @@ fn contract_deposit<S: HasStateApi>(
     // Parse the parameter.
     let params: DepositParams = ctx.parameter_cursor().get()?;
 
+    ensure!(params.amount > 0, ContractError::DepositAmountIsZero);
+
     // Get the sender who invoked this contract function.
     let sender = ctx.sender();
 
@@ -649,7 +718,7 @@ fn contract_deposit<S: HasStateApi>(
         &burn_parameter,
         EntrypointName::new_unchecked("burn"),
         Amount::zero(),
-    ).unwrap_abort();
+    )?;
 
     // Log the deposit of tokens.
     logger.log(&BridgeEvent::Deposit(DepositEvent {
@@ -869,6 +938,7 @@ fn contract_view<S: HasStateApi>(
             validators: state.validators.iter()
                 .map(|validator| validator.clone()).collect(),
             validators_required: state.validators_required,
+            version: state.version,
         }
     )
 }
@@ -977,3 +1047,601 @@ fn contract_upgrade<S: HasStateApi>(
     }
     Ok(())
 }
+
+// Tests
+
+#[concordium_cfg_test]
+mod tests {
+    use super::*;
+    use test_infrastructure::*;
+    use secp256k1::{Secp256k1, Message, SecretKey, PublicKey};
+
+    const ACCOUNT_0: AccountAddress = AccountAddress([0u8; 32]);
+    const ADDRESS_0: Address = Address::Account(ACCOUNT_0);
+    const ACCOUNT_1: AccountAddress = AccountAddress([1u8; 32]);
+    const ADDRESS_1: Address = Address::Account(ACCOUNT_1);
+    const TIME_NOW: u64 = 1675957007;
+    const TIME_EXPIRED: u64 = 1675000000;
+
+    const ADMIN_ACCOUNT: AccountAddress = AccountAddress([1u8; 32]);
+    const ADMIN_ADDRESS: Address = Address::Account(ADMIN_ACCOUNT);
+    const NEW_ADMIN_ACCOUNT: AccountAddress = AccountAddress([2u8; 32]);
+    const NEW_ADMIN_ADDRESS: Address = Address::Account(NEW_ADMIN_ACCOUNT);
+    const TOKEN_ID: ContractTokenId = TokenIdUnit();
+
+    const VALIDATOR_PRV_KEY_0: [u8; 32] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+    const VALIDATOR_PUB_KEY_0: [u8; 33] = [0x03, 0x46, 0x46, 0xae, 0x50, 0x47, 0x31, 0x6b, 0x42, 0x30, 0xd0, 0x08, 0x6c, 0x8a, 0xce, 0xc6, 0x87, 0xf0, 0x0b, 0x1c, 0xd9, 0xd1, 0xdc, 0x63, 0x4f, 0x6c, 0xb3, 0x58, 0xac, 0x0a, 0x9a, 0x8f, 0xff];
+
+    const _VALIDATOR_PRV_KEY_1: [u8; 32] = [0xd0, 0xe5, 0x15, 0x47, 0xae, 0x21, 0x7d, 0x09, 0xe3, 0x23, 0xa9, 0xba, 0xbb, 0xa1, 0x88, 0xff, 0x88, 0x70, 0xae, 0x1d, 0x62, 0x37, 0x87, 0xb2, 0x6e, 0x6e, 0x96, 0xd3, 0x89, 0x3c, 0x8c, 0x70];
+    const VALIDATOR_PUB_KEY_1: [u8; 33] = [0x02, 0xe1, 0xcd, 0x9b, 0xcc, 0xcb, 0xec, 0x11, 0x30, 0x53, 0x19, 0xa7, 0x55, 0x61, 0x42, 0xa6, 0xf3, 0x0c, 0xb9, 0x30, 0x38, 0xc3, 0xcf, 0xdb, 0x3f, 0xe0, 0x39, 0xc1, 0x9a, 0x51, 0x70, 0x00, 0x68];
+
+    /// Test helper function which creates a contract state where ADDRESS_0 owns
+    /// 400 tokens.
+    fn initial_state<S: HasStateApi>(state_builder: &mut StateBuilder<S>) -> State<S> {
+        let state = State::new(
+            state_builder,
+            ADMIN_ADDRESS,
+            ContractAddress::new(100, 100),
+            TOKEN_ID,
+            vec![VALIDATOR_PUB_KEY_0],
+            1,
+        );
+
+        state
+    }
+
+    /// Test adding an operator succeeds and the appropriate event is logged.
+    #[concordium_test]
+    fn test_add_validator() {
+        // Set up the context
+        let mut ctx = TestReceiveContext::empty();
+        ctx.set_sender(ADDRESS_0);
+
+        let mut logger = TestLogger::init();
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        let parameter = AddValidatorParams {
+            validator: VALIDATOR_PUB_KEY_1
+        };
+        let parameter_bytes = to_bytes(&parameter);
+        ctx.set_parameter(&parameter_bytes);
+
+        // Call the contract function.
+        let result: ContractResult<()> = contract_add_validator(&ctx, &mut host, &mut logger);
+
+        // Check the result.
+        claim!(result.is_err(), "Results in success");
+
+        let result = contract_view(&ctx, &host);
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        claim_eq!(result.as_ref().unwrap().validators.len(), 1, "Validators count is not equal 1");
+        claim!(!result.unwrap().validators.contains(&VALIDATOR_PUB_KEY_1), "New validator added");
+
+        ctx.set_sender(ADMIN_ADDRESS);
+
+        // Call the contract function.
+        let result: ContractResult<()> = contract_add_validator(&ctx, &mut host, &mut logger);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        // Call the contract function for duplicate validator.
+        let result: ContractResult<()> = contract_add_validator(&ctx, &mut host, &mut logger);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        let result = contract_view(&ctx, &host);
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        claim_eq!(result.as_ref().unwrap().validators.len(), 2, "Validators count is not equal 2");
+        claim_eq!(result.as_ref().unwrap().version, 1, "Version is not equal 1");
+        claim!(result.unwrap().validators.contains(&VALIDATOR_PUB_KEY_1), "New validator is not added");
+    }
+
+    #[concordium_test]
+    fn test_remove_validator() {
+        // Set up the context
+        let mut ctx = TestReceiveContext::empty();
+        ctx.set_sender(ADDRESS_0);
+
+        let mut logger = TestLogger::init();
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        host.state_mut().validators.push(VALIDATOR_PUB_KEY_1);
+
+        let parameter = RemoveValidatorParams {
+            validator: VALIDATOR_PUB_KEY_1
+        };
+        let parameter_bytes = to_bytes(&parameter);
+        ctx.set_parameter(&parameter_bytes);
+
+        // Call the contract function.
+        let result: ContractResult<()> = contract_remove_validator(&ctx, &mut host, &mut logger);
+
+        // Check the result.
+        claim!(result.is_err(), "Results in success");
+
+        let result = contract_view(&ctx, &host);
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        claim_eq!(result.as_ref().unwrap().validators.len(), 2, "Validators count is not equal 2");
+        claim!(result.unwrap().validators.contains(&VALIDATOR_PUB_KEY_1), "Existent validator removed");
+
+        ctx.set_sender(ADMIN_ADDRESS);
+
+        // Call the contract function.
+        let result: ContractResult<()> = contract_remove_validator(&ctx, &mut host, &mut logger);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        let result = contract_view(&ctx, &host);
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        claim_eq!(result.as_ref().unwrap().validators.len(), 1, "Validators count is not equal 1");
+        claim_eq!(result.as_ref().unwrap().version, 1, "Version is not equal 1");
+        claim!(!result.unwrap().validators.contains(&VALIDATOR_PUB_KEY_1), "Existent validator not removed");
+    }
+
+    #[concordium_test]
+    fn test_set_min_validators_required() {
+        // Set up the context
+        let mut ctx = TestReceiveContext::empty();
+        ctx.set_sender(ADDRESS_0);
+
+        let mut logger = TestLogger::init();
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        host.state_mut().validators.push(VALIDATOR_PUB_KEY_1);
+
+        let parameter = SetRequiredValidatorsEvent {
+            validators_required: 2
+        };
+        let parameter_bytes = to_bytes(&parameter);
+        ctx.set_parameter(&parameter_bytes);
+
+        // Call the contract function.
+        let result: ContractResult<()> = contract_set_validators_required(&ctx, &mut host, &mut logger);
+
+        // Check the result.
+        claim!(result.is_err(), "Results in success");
+
+        let result = contract_view(&ctx, &host);
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        claim_eq!(result.unwrap().validators_required, 1, "Required validators count is not equal 1");
+
+        ctx.set_sender(ADMIN_ADDRESS);
+
+        // Call the contract function.
+        let result: ContractResult<()> = contract_set_validators_required(&ctx, &mut host, &mut logger);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        let result = contract_view(&ctx, &host);
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        claim_eq!(result.unwrap().validators_required, 2, "Required validators count is not equal 2");
+    }
+
+    /// Test withdraw function.
+    #[concordium_test]
+    fn test_withdraw() {
+        // Set up the context.
+        let mut ctx = TestReceiveContext::empty();
+        ctx.set_sender(ADDRESS_1);
+        ctx.set_metadata_slot_time(Timestamp::from_timestamp_millis(TIME_NOW));
+
+        let mut logger = TestLogger::init();
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        // We are simulating reentrancy with this mock because we mutate the state.
+        host.setup_mock_entrypoint(
+            host.state().token.clone(),
+            EntrypointName::new_unchecked("mint").into(),
+            MockFn::new_v1(|_parameter, _amount, _balance, state: &mut State<TestStateApi>| {
+                Ok((true, ()))
+            }),
+        );
+
+        let crypto_primitives = TestCryptoPrimitives::new();
+
+        // Set up the parameter.
+        let wrap_params = WithdrawParams {
+            id: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            expiration: TIME_NOW + 3600 * 8,
+            to: ADDRESS_1,
+            amount: 10000u64,
+            signatures: vec![],
+            indexes: vec![0],
+        };
+        let parameter_bytes = to_bytes(&wrap_params);
+        ctx.set_parameter(&parameter_bytes);
+
+        let result: ContractResult<()> =
+            contract_withdraw(&ctx, &mut host, &mut logger, &crypto_primitives);
+
+        // Check the result.
+        claim_eq!(result.err().unwrap(), ContractError::InvalidNumberOfSignaturesAndIndexes, "Results in success");
+
+        let wrap_params = WithdrawParams {
+            id: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            expiration: TIME_NOW + 3600 * 8,
+            to: ADDRESS_1,
+            amount: 10000u64,
+            signatures: vec![[1u8; 64]],
+            indexes: vec![],
+        };
+        let parameter_bytes = to_bytes(&wrap_params);
+        ctx.set_parameter(&parameter_bytes);
+
+        let result: ContractResult<()> =
+            contract_withdraw(&ctx, &mut host, &mut logger, &crypto_primitives);
+
+        // Check the result.
+        claim_eq!(result.err().unwrap(), ContractError::InvalidNumberOfSignaturesAndIndexes, "Results in success");
+
+        let wrap_params = WithdrawParams {
+            id: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            expiration: TIME_NOW - 3600 * 8,
+            to: ADDRESS_1,
+            amount: 0,
+            signatures: vec![[1u8; 64]],
+            indexes: vec![0],
+        };
+        let parameter_bytes = to_bytes(&wrap_params);
+        ctx.set_parameter(&parameter_bytes);
+
+        let result: ContractResult<()> =
+            contract_withdraw(&ctx, &mut host, &mut logger, &crypto_primitives);
+
+        // Check the result.
+        claim_eq!(result.err().unwrap(), ContractError::WithdrawAmountIsZero, "Results in success");
+
+        let wrap_params = WithdrawParams {
+            id: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            expiration: TIME_NOW - 3600 * 8,
+            to: ADDRESS_1,
+            amount: 10000,
+            signatures: vec![[1u8; 64]],
+            indexes: vec![0],
+        };
+        let parameter_bytes = to_bytes(&wrap_params);
+        ctx.set_parameter(&parameter_bytes);
+
+        let result: ContractResult<()> =
+            contract_withdraw(&ctx, &mut host, &mut logger, &crypto_primitives);
+
+        // Check the result.
+        claim_eq!(result.err().unwrap(), ContractError::WithdrawalIsExpired, "Results in success");
+
+        let wrap_params = WithdrawParams {
+            id: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            expiration: TIME_NOW + 3600 * 8,
+            to: ADDRESS_1,
+            amount: 10000,
+            signatures: vec![[1u8; 64]],
+            indexes: vec![0],
+        };
+        let parameter_bytes = to_bytes(&wrap_params);
+        ctx.set_parameter(&parameter_bytes);
+
+        let result: ContractResult<()> =
+            contract_withdraw(&ctx, &mut host, &mut logger, &crypto_primitives);
+
+        // Check the result.
+        claim_eq!(result.err().unwrap(), ContractError::InvalidSignature, "Results in success");
+
+        let mut wrap_params = WithdrawParams {
+            id: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            expiration: TIME_NOW + 3600 * 8,
+            to: ADDRESS_1,
+            amount: 10000,
+            signatures: vec![[1u8; 64]],
+            indexes: vec![0],
+        };
+        let parameter_bytes = to_bytes(&wrap_params);
+        ctx.set_parameter(&parameter_bytes);
+
+        let result: ContractResult<(ReturnWithdrawHash)> =
+            contract_withdraw_hash(&ctx, &host, &crypto_primitives);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+        let hash = result.unwrap().hash;
+
+        let secp = Secp256k1::new();
+        let secret_key = SecretKey::from_slice(&VALIDATOR_PRV_KEY_0).expect("32 bytes, within curve order");
+        let public_key = PublicKey::from_secret_key(&secp, &secret_key);
+
+        claim_eq!(public_key.serialize(), VALIDATOR_PUB_KEY_0, "Validator 0 public key is not correctly set");
+
+        let message = Message::from_slice(&hash).expect("32 bytes");
+
+        let sig = secp.sign_ecdsa(&message, &secret_key);
+        claim!(secp.verify_ecdsa(&message, &sig, &public_key).is_ok(), "Pre-check ecdsa verification failed");
+
+        wrap_params.signatures = vec![sig.serialize_compact()];
+
+        let parameter_bytes = to_bytes(&wrap_params);
+        ctx.set_parameter(&parameter_bytes);
+
+        let result: ContractResult<()> =
+            contract_withdraw(&ctx, &mut host, &mut logger, &crypto_primitives);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        // Check the logs.
+        claim_eq!(logger.logs.len(), 1, "Only one event should be logged");
+        claim_eq!(
+            logger.logs[0],
+            to_bytes(&BridgeEvent::Withdraw(WithdrawEvent {
+                id: wrap_params.id,
+                to: wrap_params.to,
+                amount: wrap_params.amount,
+            })),
+            "Incorrect event emitted"
+        );
+
+        let result: ContractResult<()> =
+            contract_withdraw(&ctx, &mut host, &mut logger, &crypto_primitives);
+
+        // Check the result.
+        claim_eq!(result.err().unwrap(), ContractError::DuplicateWithdrawRequested, "Results in rejection");
+    }
+
+    /// Test deposit function.
+    #[concordium_test]
+    fn test_deposit() {
+        // Set up the context.
+        let mut ctx = TestReceiveContext::empty();
+        ctx.set_sender(ADDRESS_1);
+
+        let mut logger = TestLogger::init();
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        // We are simulating reentrancy with this mock because we mutate the state.
+        host.setup_mock_entrypoint(
+            host.state().token.clone(),
+            EntrypointName::new_unchecked("burn").into(),
+            MockFn::new_v1(|parameter, _amount, _balance, state: &mut State<TestStateApi>| {
+                let params: BurnParams = match from_bytes(parameter.0) {
+                    Ok(params) => params,
+                    Err(_) => return Err(CallContractError::Trap),
+                };
+
+                if params.from == ADDRESS_1 {
+                    Err(CallContractError::Trap)
+                } else {
+                    Ok((true, ()))
+                }
+            }),
+        );
+
+        // Set up the parameter.
+        let mut deposit_params = DepositParams {
+            destination: [10u8; 32],
+            amount: 10000u64,
+        };
+
+        let parameter_bytes = to_bytes(&deposit_params);
+        ctx.set_parameter(&parameter_bytes);
+
+        let result: ContractResult<()> =
+            contract_deposit(&ctx, &mut host, &mut logger);
+
+        // Check the result.
+        claim!(result.is_err(), "Results in success");
+
+        ctx.set_sender(ADDRESS_0);
+
+        let result: ContractResult<()> =
+            contract_deposit(&ctx, &mut host, &mut logger);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        // Check the logs.
+        claim_eq!(logger.logs.len(), 1, "Only one event should be logged");
+        claim_eq!(
+            logger.logs[0],
+            to_bytes(&BridgeEvent::Deposit(DepositEvent {
+                sender: ADDRESS_0,
+                destination: deposit_params.destination,
+                amount: deposit_params.amount,
+            })),
+            "Incorrect event emitted"
+        );
+    }
+
+    /// Test admin can update to a new admin address.
+    #[concordium_test]
+    fn test_update_admin() {
+        // Set up the context
+        let mut ctx = TestReceiveContext::empty();
+        ctx.set_sender(ADMIN_ADDRESS);
+        let mut logger = TestLogger::init();
+
+        // Set up the parameter.
+        let parameter_bytes = to_bytes(&[NEW_ADMIN_ADDRESS]);
+        ctx.set_parameter(&parameter_bytes);
+
+        // Set up the state and host.
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        // Check the admin state.
+        claim_eq!(host.state().admin, ADMIN_ADDRESS, "Admin should be the old admin address");
+
+        // Call the contract function.
+        let result: ContractResult<()> = contract_update_admin(&ctx, &mut host, &mut logger);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        // Check the admin state.
+        claim_eq!(host.state().admin, NEW_ADMIN_ADDRESS, "Admin should be the new admin address");
+
+        // Check the logs
+        claim_eq!(logger.logs.len(), 1, "Exactly one event should be logged");
+
+        // Check the event
+        claim!(
+            logger.logs.contains(&to_bytes(&BridgeEvent::NewAdmin(NewAdminEvent {
+                new_admin: NEW_ADMIN_ADDRESS,
+            }))),
+            "Missing event for the new admin"
+        );
+    }
+
+    /// Test that only the current admin can update the admin address.
+    #[concordium_test]
+    fn test_update_admin_not_authorized() {
+        // Set up the context.
+        let mut ctx = TestReceiveContext::empty();
+        // NEW_ADMIN is not the current admin but tries to update the admin variable to
+        // its own address.
+        ctx.set_sender(NEW_ADMIN_ADDRESS);
+        let mut logger = TestLogger::init();
+
+        // Set up the parameter.
+        let parameter_bytes = to_bytes(&[NEW_ADMIN_ADDRESS]);
+        ctx.set_parameter(&parameter_bytes);
+
+        // Set up the state and host.
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        // Check the admin state.
+        claim_eq!(host.state().admin, ADMIN_ADDRESS, "Admin should be the old admin address");
+
+        // Call the contract function.
+        let result: ContractResult<()> = contract_update_admin(&ctx, &mut host, &mut logger);
+
+        // Check that invoke failed.
+        claim_eq!(
+            result,
+            Err(ContractError::Unauthorized),
+            "Update admin should fail because not the current admin tries to update"
+        );
+
+        // Check the admin state.
+        claim_eq!(host.state().admin, ADMIN_ADDRESS, "Admin should be still the old admin address");
+    }
+
+    /// Test pausing the contract.
+    #[concordium_test]
+    fn test_pause() {
+        // Set up the context.
+        let mut ctx = TestReceiveContext::empty();
+        ctx.set_sender(ADMIN_ADDRESS);
+
+        // Set up the parameter to pause the contract.
+        let parameter_bytes = to_bytes(&true);
+        ctx.set_parameter(&parameter_bytes);
+
+        // Set up the state and host.
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        // Call the contract function.
+        let result: ContractResult<()> = contract_set_paused(&ctx, &mut host);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        // Check contract is paused.
+        claim_eq!(host.state().paused, true, "Smart contract should be paused");
+    }
+
+    /// Test unpausing the contract.
+    #[concordium_test]
+    fn test_unpause() {
+        // Set up the context.
+        let mut ctx = TestReceiveContext::empty();
+        ctx.set_sender(ADMIN_ADDRESS);
+
+        // Set up the parameter to pause the contract.
+        let parameter_bytes = to_bytes(&true);
+        ctx.set_parameter(&parameter_bytes);
+
+        // Set up the state and host.
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        // Call the contract function.
+        let result: ContractResult<()> = contract_set_paused(&ctx, &mut host);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        // Check contract is paused.
+        claim_eq!(host.state().paused, true, "Smart contract should be paused");
+
+        // Set up the parameter to unpause the contract.
+        let parameter_bytes = to_bytes(&false);
+        ctx.set_parameter(&parameter_bytes);
+
+        // Call the contract function.
+        let result: ContractResult<()> = contract_set_paused(&ctx, &mut host);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        // Check contract is unpaused.
+        claim_eq!(host.state().paused, false, "Smart contract should be unpaused");
+    }
+
+    /// Test that only the current admin can pause/unpause the contract.
+    #[concordium_test]
+    fn test_pause_not_authorized() {
+        // Set up the context.
+        let mut ctx = TestReceiveContext::empty();
+        // NEW_ADMIN is not the current admin but tries to pause/unpause the contract.
+        ctx.set_sender(NEW_ADMIN_ADDRESS);
+
+        // Set up the parameter to pause the contract.
+        let parameter_bytes = to_bytes(&true);
+        ctx.set_parameter(&parameter_bytes);
+
+        // Set up the state and host.
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        // Call the contract function.
+        let result: ContractResult<()> = contract_set_paused(&ctx, &mut host);
+
+        // Check that invoke failed.
+        claim_eq!(
+            result,
+            Err(ContractError::Unauthorized),
+            "Pause should fail because not the current admin tries to invoke it"
+        );
+    }
+}
+

@@ -1601,9 +1601,8 @@ mod tests {
 
         // Set up the parameter.
         let mint_params = MintParams {
-            to: Receiver::from_account(ACCOUNT_1),
-            amount: ContractTokenAmount::from(amount),
-            data: AdditionalData::empty(),
+            to: Address::from(ACCOUNT_1),
+            amount,
         };
         let parameter_bytes = to_bytes(&mint_params);
         ctx.set_parameter(&parameter_bytes);
@@ -1642,9 +1641,8 @@ mod tests {
 
         // Set up the parameter.
         let burn_params = BurnParams {
-            amount: ContractTokenAmount::from(amount),
-            owner: ADDRESS_1,
-            data: AdditionalData::empty(),
+            from: ADDRESS_1,
+            amount,
         };
         let parameter_bytes = to_bytes(&burn_params);
         ctx.set_parameter(&parameter_bytes);
@@ -1683,9 +1681,8 @@ mod tests {
 
         // Set up the parameter.
         let mint_params = MintParams {
-            amount: ContractTokenAmount::from(amount),
-            to: Receiver::from_account(ACCOUNT_1),
-            data: AdditionalData::empty(),
+            to: Address::from(ACCOUNT_1),
+            amount,
         };
         let parameter_bytes = to_bytes(&mint_params);
         ctx.set_parameter(&parameter_bytes);
@@ -1714,9 +1711,8 @@ mod tests {
 
         // Set up the parameter.
         let burn_params = BurnParams {
-            amount: ContractTokenAmount::from(amount),
-            owner: ADDRESS_1,
-            data: AdditionalData::empty(),
+            from: Address::from(ADDRESS_1),
+            amount,
         };
         let parameter_bytes = to_bytes(&burn_params);
         ctx.set_parameter(&parameter_bytes);
