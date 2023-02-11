@@ -1,26 +1,26 @@
 [package]
 name = "wgbm_bridge"
 version = "0.1.0"
-authors = []
+authors = ["Andrew at Bank Of Memories Inc."]
 edition = "2018"
 license = "APACHE-2.0"
 
 [features]
-default = ["std", "crypto-primitives"]
-crypto-primitives = ["concordium-std/crypto-primitives"]
-std = ["concordium-std/std", "concordium-cis2/std"]
+default = ["std"]
+std = ["concordium-std/std", "concordium-cis2/std", "concordium-std/crypto-primitives"]
+wee_alloc = ["concordium-std/wee_alloc"]
 
 [dependencies]
 wgbm_shared = {path = "../shared"}
-concordium-std = "5.1"
-concordium-cis2 = "2.0"
+concordium-std = {version = "6.0", default-features = false}
+concordium-cis2 = {version = "3.0", default-features = false}
 
 [lib]
 crate-type=["cdylib", "rlib"]
 
 [profile.release]
-opt-level = "s"
 codegen-units = 1
+opt-level = "s"
 
 [dev-dependencies]
 secp256k1 = "0.26.0"

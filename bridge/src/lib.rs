@@ -66,7 +66,7 @@ struct InitParams {
 /// Takes an amount of tokens and unwraps the CCD and sends it to a receiver.
 #[derive(Serialize, SchemaType)]
 struct DepositParams {
-    destination: [u8; 32],
+    destination: [u8; 256],
     amount: u64,
 }
 
@@ -187,7 +187,7 @@ struct NewAdminEvent {
 #[derive(Serial, SchemaType, Clone)]
 struct DepositEvent {
     sender: Address,
-    destination: [u8; 32],
+    destination: [u8; 256],
     amount: u64,
 }
 
@@ -1061,7 +1061,6 @@ mod tests {
     const ACCOUNT_1: AccountAddress = AccountAddress([1u8; 32]);
     const ADDRESS_1: Address = Address::Account(ACCOUNT_1);
     const TIME_NOW: u64 = 1675957007;
-    const TIME_EXPIRED: u64 = 1675000000;
 
     const ADMIN_ACCOUNT: AccountAddress = AccountAddress([1u8; 32]);
     const ADMIN_ADDRESS: Address = Address::Account(ADMIN_ACCOUNT);
@@ -1256,7 +1255,7 @@ mod tests {
         host.setup_mock_entrypoint(
             host.state().token.clone(),
             EntrypointName::new_unchecked("mint").into(),
-            MockFn::new_v1(|_parameter, _amount, _balance, state: &mut State<TestStateApi>| {
+            MockFn::new_v1(|_parameter, _amount, _balance, _state: &mut State<TestStateApi>| {
                 Ok((true, ()))
             }),
         );
@@ -1360,7 +1359,7 @@ mod tests {
         let parameter_bytes = to_bytes(&wrap_params);
         ctx.set_parameter(&parameter_bytes);
 
-        let result: ContractResult<(ReturnWithdrawHash)> =
+        let result: ContractResult<ReturnWithdrawHash> =
             contract_withdraw_hash(&ctx, &host, &crypto_primitives);
 
         // Check the result.
@@ -1424,7 +1423,7 @@ mod tests {
         host.setup_mock_entrypoint(
             host.state().token.clone(),
             EntrypointName::new_unchecked("burn").into(),
-            MockFn::new_v1(|parameter, _amount, _balance, state: &mut State<TestStateApi>| {
+            MockFn::new_v1(|parameter, _amount, _balance, _state: &mut State<TestStateApi>| {
                 let params: BurnParams = match from_bytes(parameter.0) {
                     Ok(params) => params,
                     Err(_) => return Err(CallContractError::Trap),
@@ -1439,7 +1438,7 @@ mod tests {
         );
 
         // Set up the parameter.
-        let mut deposit_params = DepositParams {
+        let deposit_params = DepositParams {
             destination: [10u8; 32],
             amount: 10000u64,
         };
