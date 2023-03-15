@@ -1,0 +1,23 @@
+[package]
+name = "wgbm_staking"
+version = "0.1.0"
+authors = ["Andrew at Bank Of Memories Inc."]
+edition = "2018"
+license = "APACHE-2.0"
+
+[features]
+default = ["std"]
+std = ["concordium-std/std", "concordium-cis2/std", "concordium-std/crypto-primitives"]
+wee_alloc = ["concordium-std/wee_alloc"]
+
+[dependencies]
+wgbm_shared = {path = "../shared"}
+concordium-std = {version = "6.0", default-features = false}
+concordium-cis2 = {version = "3.0", default-features = false}
+
+[lib]
+crate-type=["cdylib", "rlib"]
+
+[profile.release]
+codegen-units = 1
+opt-level = "s"
