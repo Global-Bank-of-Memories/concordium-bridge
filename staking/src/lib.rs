@@ -100,8 +100,6 @@ struct StakeParams {
 struct UnstakeParams {
     // pool id to unstake
     pool_id: u32,
-    // the amount of tokens to be unstaken
-    amount: u64,
     // entrypoint name in case if sender is contract
     owned_entrypoint_name: String,
 }
@@ -482,7 +480,7 @@ impl<S: HasStateApi> State<S> {
         return Err(ContractError::UnknownPool);
     }
 
-    fn unstake(&mut self, pool_id: u32, user: Address, last_block: u64) -> Result<u64, ContractError> {
+    fn unstake(&mut self, pool_id: u32, user: Address, last_block: u64) -> Result<(u64, u64), ContractError> {
         if let Some(mut pool) = self.pools.get_mut(&pool_id) {
             let pool_stakers = self.pool_stakers.entry(pool_id);
 
@@ -503,7 +501,7 @@ impl<S: HasStateApi> State<S> {
 
                     pool.tokens_staked -= amount;
 
-                    return Ok(amount + harvested_amount);
+                    return Ok((amount, harvested_amount));
                 } else {
                     return Err(ContractError::UnknownStaker);
                 }
@@ -686,7 +684,7 @@ fn contract_create_pool<S: HasStateApi>(
     let (state, builder) = host.state_and_builder();
 
     // Check that contract is not paused.
-    ensure!(state.paused, ContractError::ContractPaused);
+    ensure!(!state.paused, ContractError::ContractPaused);
 
     // Check that only the current admin is authorized to update the admin address.
     ensure_eq!(ctx.sender(), state.admin, ContractError::Unauthorized);
@@ -719,7 +717,7 @@ fn contract_transfer_notification<S: HasStateApi>(
     let state = host.state();
 
     // Check that contract is not paused.
-    ensure!(state.paused, ContractError::ContractPaused);
+    ensure!(!state.paused, ContractError::ContractPaused);
 
     let params: OnReceivingCis2Params<TokenIdUnit, TokenAmountU64> = ctx.parameter_cursor().get()?;
 
@@ -745,7 +743,7 @@ fn contract_stake<S: HasStateApi>(
 ) -> ContractResult<()>
 {
     // Check that contract is not paused.
-    ensure!(host.state().paused, ContractError::ContractPaused);
+    ensure!(!host.state().paused, ContractError::ContractPaused);
 
     // Parse the parameter.
     let params: StakeParams = ctx.parameter_cursor().get()?;
@@ -824,14 +822,8 @@ fn contract_unstake<S: HasStateApi>(
     // Parse the parameter.
     let params: UnstakeParams = ctx.parameter_cursor().get()?;
 
-    ensure!(params.amount > 0, ContractError::UnstakeAmountIsZero);
-
     let last_block = ctx.metadata().slot_time().timestamp_millis() / BLOCK_TIMESTAMP_DIVISOR;
-    let result = host.state_mut().unstake(params.pool_id, sender, last_block);
-
-    if let Err(err) = result {
-        bail!(err);
-    }
+    let result = host.state_mut().unstake(params.pool_id, sender, last_block)?;
 
     transfer(
         host,
@@ -842,14 +834,21 @@ fn contract_unstake<S: HasStateApi>(
             Address::Account(account) => Receiver::Account(account),
             Address::Contract(contract) => Receiver::Contract(contract, OwnedEntrypointName::new_unchecked(params.owned_entrypoint_name)),
         },
-        result.ok().unwrap(),
+        result.0 + result.1,
     )?;
 
     // Log withdrawal.
     logger.log(&StakingEvent::Unstaked(UnstakedEvent {
         pool_id: params.pool_id,
         recipient: sender,
-        amount: params.amount,
+        amount: result.0,
+    }))?;
+
+    // Log the deposit of tokens.
+    logger.log(&StakingEvent::HarvestedRewards(HarvestedRewardsEvent {
+        pool_id: params.pool_id,
+        recipient: sender,
+        amount: result.1,
     }))?;
 
     Ok(())
@@ -1162,80 +1161,63 @@ mod tests {
     /// Test helper function which creates a contract state where ADDRESS_0 owns
     /// 400 tokens.
     fn initial_state<S: HasStateApi>(state_builder: &mut StateBuilder<S>) -> State<S> {
-        let state = State::new(
+        let mut state = State::new(
             state_builder,
             ADMIN_ADDRESS,
             ContractAddress::new(100, 100),
             TOKEN_ID,
         );
 
+        state.create_pool(state_builder, 1);
+
         state
     }
 
-    /// Test withdraw function.
+    /// Test stake & unstake function.
     #[concordium_test]
-    fn test_unstake() {
+    fn test_stake() {
         // Set up the context.
         let mut ctx = TestReceiveContext::empty();
-        ctx.set_sender(ADDRESS_1);
-        ctx.set_metadata_slot_time(Timestamp::from_timestamp_millis(TIME_NOW));
 
         let mut logger = TestLogger::init();
         let mut state_builder = TestStateBuilder::new();
         let state = initial_state(&mut state_builder);
         let mut host = TestHost::new(state, state_builder);
 
-        // // We are simulating reentrancy with this mock because we mutate the state.
-        // host.setup_mock_entrypoint(
-        //     host.state().token.clone(),
-        //     EntrypointName::new_unchecked("mint").into(),
-        //     MockFn::new_v1(|_parameter, _amount, _balance, _state: &mut State<TestStateApi>| {
-        //         Ok((true, ()))
-        //     }),
-        // );
-    }
-
-    /// Test deposit function.
-    #[concordium_test]
-    fn test_deposit() {
-        // Set up the context.
-        let mut ctx = TestReceiveContext::empty();
         ctx.set_sender(ADDRESS_1);
+        // We are simulating reentrancy with this mock because we mutate the state.
+        host.setup_mock_entrypoint(
+            host.state().token.clone(),
+            EntrypointName::new_unchecked("transfer").into(),
+            MockFn::new_v1(|parameter, _amount, _balance, _state: &mut State<TestStateApi>| {
+                let params: TransferParameter = match from_bytes(parameter.0) {
+                    Ok(params) => params,
+                    Err(_) => return Err(CallContractError::Trap),
+                };
 
-        let mut logger = TestLogger::init();
-        let mut state_builder = TestStateBuilder::new();
-        let state = initial_state(&mut state_builder);
-        let mut host = TestHost::new(state, state_builder);
+                if params.0[0].from == ADDRESS_1 {
+                    return Err(CallContractError::Trap);
+                } else if params.0[0].from == ADDRESS_0 {
+                    return Ok((true, ()));
+                }
 
-        // // We are simulating reentrancy with this mock because we mutate the state.
-        // host.setup_mock_entrypoint(
-        //     host.state().token.clone(),
-        //     EntrypointName::new_unchecked("burn").into(),
-        //     MockFn::new_v1(|parameter, _amount, _balance, _state: &mut State<TestStateApi>| {
-        //         let params: BurnParams = match from_bytes(parameter.0) {
-        //             Ok(params) => params,
-        //             Err(_) => return Err(CallContractError::Trap),
-        //         };
-        //
-        //         if params.from == ADDRESS_1 {
-        //             Err(CallContractError::Trap)
-        //         } else {
-        //             Ok((true, ()))
-        //         }
-        //     }),
-        // );
+                Ok((true, ()))
+            }),
+        );
 
         // Set up the parameter.
-        let deposit_params = StakeParams {
-            pool_id: 1,
+        let stake_params = StakeParams {
+            pool_id: 0,
             amount: 10000u64,
+            owned_entrypoint_name: "".to_string(),
         };
 
-        let parameter_bytes = to_bytes(&deposit_params);
+        let parameter_bytes = to_bytes(&stake_params);
         ctx.set_parameter(&parameter_bytes);
+        ctx.set_self_address(ContractAddress::new(0, 0));
+        ctx.set_metadata_slot_time(SlotTime::from_timestamp_millis(TIME_NOW * 1000));
 
-        let result: ContractResult<()> =
-            contract_stake(&ctx, &mut host, &mut logger);
+        let result: ContractResult<()> = contract_stake(&ctx, &mut host, &mut logger);
 
         // Check the result.
         claim!(result.is_err(), "Results in success");
@@ -1252,9 +1234,134 @@ mod tests {
         claim_eq!(logger.logs.len(), 1, "Only one event should be logged");
         claim_eq!(
             logger.logs[0],
-            to_bytes(&StakingEvent::StakedEvent(StakedEvent {
+            to_bytes(&StakingEvent::Staked(StakedEvent {
+                pool_id: 0,
                 sender: ADDRESS_0,
-                amount: deposit_params.amount,
+                amount: stake_params.amount,
+            })),
+            "Incorrect event emitted"
+        );
+
+        // Set up the parameter.
+        let unstake_params = UnstakeParams {
+            pool_id: 0,
+            owned_entrypoint_name: "".to_string(),
+        };
+
+        let unstake_parameter_bytes = to_bytes(&unstake_params);
+        ctx.set_parameter(&unstake_parameter_bytes);
+        ctx.set_metadata_slot_time(SlotTime::from_timestamp_millis((TIME_NOW + 86400 * 10) * 1000));
+
+        let result: ContractResult<()> = contract_unstake(&ctx, &mut host, &mut logger);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        // Check the logs.
+        claim_eq!(logger.logs.len(), 3, "Only one event should be logged");
+
+        claim_eq!(
+            logger.logs[1],
+            to_bytes(&StakingEvent::Unstaked(UnstakedEvent {
+                pool_id: 0,
+                recipient: ADDRESS_0,
+                amount: stake_params.amount,
+            })),
+            "Incorrect event emitted"
+        );
+
+        claim_eq!(
+            logger.logs[2],
+            to_bytes(&StakingEvent::HarvestedRewards(HarvestedRewardsEvent {
+                pool_id: 0,
+                recipient: ADDRESS_0,
+                amount: 864000,
+            })),
+            "Incorrect event emitted"
+        );
+    }
+
+    /// Test harvest_rewards function.
+    #[concordium_test]
+    fn test_harvest_rewards() {
+        // Set up the context.
+        let mut ctx = TestReceiveContext::empty();
+
+        let mut logger = TestLogger::init();
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        ctx.set_sender(ADDRESS_1);
+        // We are simulating reentrancy with this mock because we mutate the state.
+        host.setup_mock_entrypoint(
+            host.state().token.clone(),
+            EntrypointName::new_unchecked("transfer").into(),
+            MockFn::new_v1(|parameter, _amount, _balance, _state: &mut State<TestStateApi>| {
+                let params: TransferParameter = match from_bytes(parameter.0) {
+                    Ok(params) => params,
+                    Err(_) => return Err(CallContractError::Trap),
+                };
+
+                Ok((true, ()))
+            }),
+        );
+
+        // Set up the parameter.
+        let stake_params = StakeParams {
+            pool_id: 0,
+            amount: 10000u64,
+            owned_entrypoint_name: "".to_string(),
+        };
+
+        let parameter_bytes = to_bytes(&stake_params);
+        ctx.set_parameter(&parameter_bytes);
+        ctx.set_self_address(ContractAddress::new(0, 0));
+        ctx.set_metadata_slot_time(SlotTime::from_timestamp_millis(TIME_NOW * 1000));
+
+        ctx.set_sender(ADDRESS_0);
+
+        let result: ContractResult<()> = contract_stake(&ctx, &mut host, &mut logger);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        // Check the logs.
+        claim_eq!(logger.logs.len(), 1, "Only one event should be logged");
+        claim_eq!(
+            logger.logs[0],
+            to_bytes(&StakingEvent::Staked(StakedEvent {
+                pool_id: 0,
+                sender: ADDRESS_0,
+                amount: stake_params.amount,
+            })),
+            "Incorrect event emitted"
+        );
+
+        // Set up the parameter.
+        let harvest_rewards_params = HarvestRewardsParams {
+            pool_id: 0,
+            owned_entrypoint_name: "".to_string(),
+        };
+
+        let harvest_rewards_parameter_bytes = to_bytes(&harvest_rewards_params);
+        ctx.set_parameter(&harvest_rewards_parameter_bytes);
+        ctx.set_metadata_slot_time(SlotTime::from_timestamp_millis((TIME_NOW + 86400 * 10) * 1000));
+
+        let result: ContractResult<()> = contract_harvest_rewards(&ctx, &mut host, &mut logger);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        // Check the logs.
+        claim_eq!(logger.logs.len(), 2, "Only one event should be logged");
+
+        claim_eq!(
+            logger.logs[1],
+            to_bytes(&StakingEvent::HarvestedRewards(HarvestedRewardsEvent {
+                pool_id: 0,
+                recipient: ADDRESS_0,
+                amount: 864000,
             })),
             "Incorrect event emitted"
         );
