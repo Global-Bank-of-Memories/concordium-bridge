@@ -3,7 +3,7 @@
 use concordium_cis2::{Cis2Event, *};
 use concordium_std::{collections::BTreeMap, *};
 
-use wgbm_shared::{MintParams, BurnParams};
+use wgbm_shared::{MintParams, BurnParams, TransferParameter, ContractTokenAmount, ContractTokenId};
 
 /// The id of the wGBM token in this contract.
 const TOKEN_ID_WGBM: ContractTokenId = TokenIdUnit();
@@ -15,16 +15,6 @@ pub const SET_BRIDGE_EVENT_TAG: u8 = 1;
 /// List of supported standards by this contract address.
 const SUPPORTS_STANDARDS: [StandardIdentifier<'static>; 2] =
     [CIS0_STANDARD_IDENTIFIER, CIS2_STANDARD_IDENTIFIER];
-
-// Types
-
-/// Contract token ID type.
-/// Since this contract will only ever contain this one token type, we use the
-/// smallest possible token ID.
-type ContractTokenId = TokenIdUnit;
-
-/// Contract token amount type.
-type ContractTokenAmount = TokenAmountU64;
 
 /// The state tracked for each address.
 #[derive(Serial, DeserialWithState, Deletable, StateClone)]
@@ -786,10 +776,6 @@ fn contract_state_set_metadata_url<S: HasStateApi>(
 
     Ok(())
 }
-
-// Contract functions required by the CIS-2 standard
-
-type TransferParameter = TransferParams<ContractTokenId, ContractTokenAmount>;
 
 /// Execute a list of token transfers, in the order of the list.
 ///

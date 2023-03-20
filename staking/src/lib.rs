@@ -1,14 +1,19 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 use std::collections::BTreeMap;
-use concordium_cis2::{CIS0_STANDARD_IDENTIFIER, StandardIdentifier, StandardIdentifierOwned, SupportResult, SupportsQueryParams, SupportsQueryResponse, TokenIdUnit};
+use concordium_cis2::{AdditionalData, CIS0_STANDARD_IDENTIFIER, OnReceivingCis2Params, Receiver, StandardIdentifier, StandardIdentifierOwned, SupportResult, SupportsQueryParams, SupportsQueryResponse, TokenAmountU64, TokenIdUnit, Transfer, TransferParams};
 use concordium_std::{*};
+use wgbm_shared::TransferParameter;
 
 /// Tag for the NewAdmin event.
 pub const NEW_ADMIN_EVENT_TAG: u8 = 0;
 pub const STAKED_EVENT_TAG: u8 = 1;
 pub const UNSTAKED_EVENT_TAG: u8 = 2;
 pub const HARVESTED_REWARDS_EVENT_TAG: u8 = 3;
+pub const CREATED_POOL_EVENT_TAG: u8 = 4;
+
+pub const REWARD_MULTIPLIER: u64 = 1000000;
+pub const BLOCK_TIMESTAMP_DIVISOR: u64 = 1000;
 
 /// List of supported standards by this contract address.
 const SUPPORTS_STANDARDS: [StandardIdentifier<'static>; 1] =
@@ -20,6 +25,24 @@ const SUPPORTS_STANDARDS: [StandardIdentifier<'static>; 1] =
 /// Since this contract will only ever contain this one token type, we use the
 /// smallest possible token ID.
 type ContractTokenId = TokenIdUnit;
+
+#[derive(Serial, DeserialWithState, Deletable, StateClone)]
+#[concordium(state_parameter = "S")]
+struct PoolState<S> {
+    id: u32,
+    reward_tokens_per_block: u64,
+    tokens_staked: u64,
+    last_rewarded_block: u64,
+    accumulated_rewards_per_share: u64,
+    stakers: StateSet<Address, S>,
+}
+
+#[derive(Serial, Deserial)]
+struct PoolStaker {
+    amount: u64,
+    rewards: u64,
+    reward_debt: u64,
+}
 
 /// The contract state,
 #[derive(Serial, DeserialWithState, StateClone)]
@@ -35,16 +58,28 @@ struct State<S: HasStateApi> {
     token_id: ContractTokenId,
     /// Contract is paused if `paused = true` and unpaused if `paused = false`.
     paused: bool,
+    /// Registered pools
+    pools: StateMap<u32, PoolState<S>, S>,
+    /// Stakers to pools
+    pool_stakers: StateMap<u32, StateMap<Address, PoolStaker, S>, S>,
+    /// last id of registered pool
+    last_pool_id: u32,
     /// Map with contract addresses providing implementations of additional
     /// standards.
     implementors: StateMap<StandardIdentifierOwned, Vec<ContractAddress>, S>,
 }
 
-/// The parameter type for the contract initialization`.
+/// The parameter type for the contract initialization.
 #[derive(Serialize, SchemaType)]
 struct InitParams {
     token: ContractAddress,
     token_id: ContractTokenId,
+}
+
+/// The parameter type for the pool creation.
+#[derive(Serialize, SchemaType)]
+struct CreatePoolParams {
+    reward_tokens_per_block: u64,
 }
 
 /// The parameter type for the contract function `unwrap`.
@@ -55,6 +90,8 @@ struct StakeParams {
     pool_id: u32,
     // amount of tokens to stake
     amount: u64,
+    // entrypoint name in case if sender is contract
+    owned_entrypoint_name: String,
 }
 
 /// The parameter type for the contract function `unstake`.
@@ -65,13 +102,18 @@ struct UnstakeParams {
     pool_id: u32,
     // the amount of tokens to be unstaken
     amount: u64,
+    // entrypoint name in case if sender is contract
+    owned_entrypoint_name: String,
 }
 
 /// The parameter type for the contract function `harvest_rewards`.
 /// It includes a receiver for receiving the wrapped CCD tokens.
 #[derive(Serialize, SchemaType)]
 struct HarvestRewardsParams {
+    // pool id to harvest
     pool_id: u32,
+    // entrypoint name in case if sender is contract
+    owned_entrypoint_name: String,
 }
 
 /// The parameter type for the contract function `contract_get_pool_stake`.
@@ -143,7 +185,7 @@ struct NewAdminEvent {
     new_admin: Address,
 }
 
-/// A NewAdminEvent introduced by this smart contract.
+/// A StakedEvent introduced by this smart contract.
 #[derive(Serial, SchemaType, Clone)]
 struct StakedEvent {
     // pool_id
@@ -154,7 +196,7 @@ struct StakedEvent {
     amount: u64,
 }
 
-/// A NewAdminEvent introduced by this smart contract.
+/// A UnstakedEvent introduced by this smart contract.
 #[derive(Serial, SchemaType, Clone)]
 struct UnstakedEvent {
     pool_id: u32,
@@ -170,41 +212,52 @@ struct HarvestedRewardsEvent {
     amount: u64,
 }
 
+/// A PoolCreatedEvent introduced by this smart contract.
+#[derive(Serial, SchemaType, Clone)]
+struct PoolCreatedEvent {
+    pool_id: u32,
+}
+
 /// Tagged events to be serialized for the event log.
-enum BridgeEvent {
+enum StakingEvent {
     NewAdmin(NewAdminEvent),
     Staked(StakedEvent),
     Unstaked(UnstakedEvent),
     HarvestedRewards(HarvestedRewardsEvent),
+    CreatedPool(PoolCreatedEvent),
 }
 
-impl Serial for BridgeEvent {
+impl Serial for StakingEvent {
     fn serial<W: Write>(&self, out: &mut W) -> Result<(), W::Err> {
         match self {
-            BridgeEvent::NewAdmin(event) => {
+            StakingEvent::NewAdmin(event) => {
                 out.write_u8(NEW_ADMIN_EVENT_TAG)?;
                 event.serial(out)
             }
-            BridgeEvent::Staked(event) => {
+            StakingEvent::Staked(event) => {
                 out.write_u8(STAKED_EVENT_TAG)?;
                 event.serial(out)
             }
-            BridgeEvent::Unstaked(event) => {
+            StakingEvent::Unstaked(event) => {
                 out.write_u8(UNSTAKED_EVENT_TAG)?;
                 event.serial(out)
             }
-            BridgeEvent::HarvestedRewards(event) => {
+            StakingEvent::HarvestedRewards(event) => {
                 out.write_u8(HARVESTED_REWARDS_EVENT_TAG)?;
+                event.serial(out)
+            }
+            StakingEvent::CreatedPool(event) => {
+                out.write_u8(CREATED_POOL_EVENT_TAG)?;
                 event.serial(out)
             }
         }
     }
 }
 
-/// Manual implementation of the `BridgeEventSchema` which includes both the
+/// Manual implementation of the `StakingEventSchema` which includes both the
 /// events specified in this contract and the events specified in the CIS-2
 /// library. The events are tagged to distinguish them on-chain.
-impl schema::SchemaType for BridgeEvent {
+impl schema::SchemaType for StakingEvent {
     fn get_type() -> schema::Type {
         let mut event_map = BTreeMap::new();
         event_map.insert(
@@ -247,7 +300,15 @@ impl schema::SchemaType for BridgeEvent {
                 ]),
             ),
         );
-        // @TODO: Create Pool event
+        event_map.insert(
+            CREATED_POOL_EVENT_TAG,
+            (
+                "CreatedPool".to_string(),
+                schema::Fields::Named(vec![
+                    (String::from("pool_id"), u32::get_type()),
+                ]),
+            ),
+        );
 
         schema::Type::TaggedEnum(event_map)
     }
@@ -288,6 +349,14 @@ enum ContractError {
     StakeIsExpired,
     /// Requested stake amount is zero
     StakeAmountIsZero,
+    // Referred pool is unknown
+    UnknownPool,
+    // Referred staker is unknown
+    UnknownStaker,
+    // Unknown token notified about transfer
+    UnknownTokenReceived,
+    // Failed to transfer token
+    FailedToTransfer
 }
 
 type ContractResult<A> = Result<A, ContractError>;
@@ -332,6 +401,9 @@ impl<S: HasStateApi> State<S> {
             token,
             token_id,
             paused: false,
+            pools: state_builder.new_map(),
+            pool_stakers: state_builder.new_map(),
+            last_pool_id: 0,
             implementors: state_builder.new_map(),
         }
     }
@@ -353,9 +425,214 @@ impl<S: HasStateApi> State<S> {
     ) {
         self.implementors.insert(std_id, implementors);
     }
+
+    fn create_pool(&mut self, state_builder: &mut StateBuilder<S>, reward_tokens_per_block: u64) -> u32 {
+        let pool_id = self.last_pool_id;
+
+        let pool = PoolState {
+            id: pool_id,
+            reward_tokens_per_block,
+            tokens_staked: 0,
+            last_rewarded_block: 0,
+            accumulated_rewards_per_share: 0,
+            stakers: state_builder.new_set()
+        };
+
+        self.pools.insert(pool_id, pool);
+
+        self.last_pool_id += 1;
+
+        pool_id
+    }
+
+    fn get_pool(&self, pool_id: u32) -> Option<StateRef<PoolState<S>>> {
+        self.pools.get(&pool_id)
+    }
+
+    fn stake(&mut self, state_builder: &mut StateBuilder<S>, pool_id: u32, user: Address, amount: u64, last_block: u64) -> Result<u64, ContractError> {
+        if amount == 0 {
+            return Err(ContractError::StakeAmountIsZero);
+        }
+
+        if let Some(mut pool) = self.pools.get_mut(&pool_id) {
+            let pool: &mut PoolState<S> = &mut pool;
+
+            let pool_stakers = &mut self.pool_stakers.entry(pool_id).or_insert_with(|| state_builder.new_map());
+
+            let pool_staker = &mut pool_stakers.entry(user).or_insert_with(|| {
+                pool.stakers.insert(user);
+
+                PoolStaker {
+                    amount: 0,
+                    rewards: 0,
+                    reward_debt: 0,
+                }
+            });
+
+            let harvested_amount = Self::harvest_rewards_logic(pool, pool_staker, last_block);
+
+            pool_staker.amount += amount;
+            pool_staker.reward_debt = pool_staker.amount * pool.accumulated_rewards_per_share / 1;
+
+            pool.tokens_staked += amount;
+
+            return Ok(harvested_amount);
+        }
+
+        return Err(ContractError::UnknownPool);
+    }
+
+    fn unstake(&mut self, pool_id: u32, user: Address, last_block: u64) -> Result<u64, ContractError> {
+        if let Some(mut pool) = self.pools.get_mut(&pool_id) {
+            let pool_stakers = self.pool_stakers.entry(pool_id);
+
+            if let Entry::Occupied(mut pool_stakers) = pool_stakers {
+                let pool_staker = pool_stakers.entry(user);
+
+                if let Entry::Occupied(mut pool_staker) = pool_staker {
+                    if pool_staker.amount == 0 {
+                        return Err(ContractError::UnstakeAmountIsZero);
+                    }
+
+                    let harvested_amount = Self::harvest_rewards_logic(&mut pool, &mut pool_staker, last_block);
+
+                    let amount = pool_staker.amount;
+
+                    pool_staker.amount = 0;
+                    pool_staker.reward_debt = pool_staker.amount * pool.accumulated_rewards_per_share / REWARD_MULTIPLIER;
+
+                    pool.tokens_staked -= amount;
+
+                    return Ok(amount + harvested_amount);
+                } else {
+                    return Err(ContractError::UnknownStaker);
+                }
+            } else {
+                return Err(ContractError::UnknownPool);
+            }
+        }
+
+        return Err(ContractError::UnknownPool);
+    }
+
+    fn harvest_rewards(&mut self, pool_id: u32, user: Address, last_block: u64) -> Result<u64, ContractError> {
+        if let Some(mut pool) = self.pools.get_mut(&pool_id) {
+            let pool_stakers = self.pool_stakers.entry(pool_id);
+
+            if let Entry::Occupied(mut pool_stakers) = pool_stakers {
+                let pool_staker = pool_stakers.entry(user);
+
+                if let Entry::Occupied(mut pool_staker) = pool_staker {
+                    if pool_staker.amount == 0 {
+                        return Ok(0);
+                    }
+
+                    let harvested_amount = Self::harvest_rewards_logic(&mut pool, &mut pool_staker, last_block);
+
+                    return Ok(harvested_amount);
+                } else {
+                    return Err(ContractError::UnknownStaker);
+                }
+            } else {
+                return Err(ContractError::UnknownPool);
+            }
+        }
+
+        return Err(ContractError::UnknownPool);
+    }
+
+    fn calculate_rewards_logic(&self, pool_id: u32, user: Address, last_block: u64) -> Result<u64, ContractError> {
+        if let Some(pool) = self.pools.get(&pool_id) {
+            let pool_stakers = self.pool_stakers.get(&pool_id);
+
+            if let Some(pool_stakers) = pool_stakers {
+                let pool_staker = pool_stakers.get(&user);
+
+                if let Some(pool_staker) = pool_staker {
+                    if pool_staker.amount == 0 {
+                        return Ok(0);
+                    }
+
+                    let blocks_since_last_reward = last_block - pool.last_rewarded_block;
+
+                    let rewards: u64 = blocks_since_last_reward * pool.reward_tokens_per_block;
+
+                    let accumulated_rewards_per_share = pool.accumulated_rewards_per_share + (rewards * REWARD_MULTIPLIER / pool.tokens_staked);
+
+                    let rewards_to_harvest: u64 = (pool_staker.amount * accumulated_rewards_per_share / REWARD_MULTIPLIER) - pool_staker.reward_debt;
+
+                    return Ok(rewards_to_harvest);
+                } else {
+                    return Err(ContractError::UnknownStaker);
+                }
+            } else {
+                return Err(ContractError::UnknownPool);
+            }
+        }
+
+        return Err(ContractError::UnknownPool);
+    }
+
+    fn harvest_rewards_logic(pool: &mut PoolState<S>, pool_staker: &mut PoolStaker, last_block: u64) -> u64 {
+        Self::update_pool_rewards(pool, last_block);
+
+        let rewards_to_harvest: u64 = (pool_staker.amount * pool.accumulated_rewards_per_share / REWARD_MULTIPLIER) - pool_staker.reward_debt;
+
+        if rewards_to_harvest == 0 {
+            pool_staker.reward_debt = pool_staker.amount * pool.accumulated_rewards_per_share / REWARD_MULTIPLIER;
+
+            return 0;
+        }
+
+        pool_staker.rewards = 0;
+        pool_staker.reward_debt = pool_staker.amount * pool.accumulated_rewards_per_share / REWARD_MULTIPLIER;
+
+        return rewards_to_harvest;
+    }
+
+    fn update_pool_rewards(pool: &mut PoolState<S>, last_block: u64) {
+        if pool.tokens_staked == 0 {
+            pool.last_rewarded_block = last_block;
+
+            return;
+        }
+
+        let blocks_since_last_reward = last_block - pool.last_rewarded_block;
+
+        let rewards: u64 = blocks_since_last_reward * pool.reward_tokens_per_block;
+
+        pool.accumulated_rewards_per_share = pool.accumulated_rewards_per_share + (rewards * REWARD_MULTIPLIER / pool.tokens_staked);
+
+        pool.last_rewarded_block = last_block;
+    }
 }
 
 // Contract functions
+
+fn transfer<S: HasStateApi>(host: &mut impl HasHost<State<S>, StateApiType=S>, token: ContractAddress, token_id: ContractTokenId, sender: Address, to: Receiver, amount: u64) -> Result<(), ContractError> {
+    let transfer_params: TransferParameter = TransferParams(vec![
+        Transfer {
+            token_id,
+            amount: TokenAmountU64::from(amount),
+            /// The address owning the tokens being transferred.
+            from: sender,
+            /// The address receiving the tokens being transferred.
+            to,
+            /// Additional data to include in the transfer.
+            /// Can be used for additional arguments.
+            data: AdditionalData::empty(),
+        }
+    ]);
+
+    host.invoke_contract(
+        &token,
+        &transfer_params,
+        EntrypointName::new_unchecked("transfer"),
+        Amount::zero(),
+    ).map_err(|_error| ContractError::FailedToTransfer)?;
+
+    Ok(())
+}
 
 /// Initialize contract instance with no initial tokens.
 /// Logs a `Mint` event for the single token id with no amounts.
@@ -365,7 +642,7 @@ impl<S: HasStateApi> State<S> {
 contract = "gbm_Staking",
 enable_logger,
 parameter = "InitParams",
-event = "BridgeEvent"
+event = "StakingEvent"
 )]
 fn contract_init<S: HasStateApi>(
     ctx: &impl HasInitContext,
@@ -385,11 +662,141 @@ fn contract_init<S: HasStateApi>(
     let state = State::new(state_builder, invoker, token_address, token_id);
 
     // Log event for the new admin.
-    logger.log(&BridgeEvent::NewAdmin(NewAdminEvent {
+    logger.log(&StakingEvent::NewAdmin(NewAdminEvent {
         new_admin: invoker,
     }))?;
 
     Ok(state)
+}
+
+/// Create new pool
+#[receive(
+contract = "gbm_Staking",
+name = "createPool",
+parameter = "CreatePoolParams",
+error = "ContractError",
+mutable,
+enable_logger,
+)]
+fn contract_create_pool<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &mut impl HasHost<State<S>, StateApiType=S>,
+    logger: &mut impl HasLogger,
+) -> ContractResult<()> {
+    let (state, builder) = host.state_and_builder();
+
+    // Check that contract is not paused.
+    ensure!(state.paused, ContractError::ContractPaused);
+
+    // Check that only the current admin is authorized to update the admin address.
+    ensure_eq!(ctx.sender(), state.admin, ContractError::Unauthorized);
+
+    // Parse the parameter.
+    let params: CreatePoolParams = ctx.parameter_cursor().get()?;
+
+    let pool_id = state.create_pool(builder, params.reward_tokens_per_block);
+
+    // Log withdrawal.
+    logger.log(&StakingEvent::CreatedPool(PoolCreatedEvent {
+        pool_id,
+    }))?;
+
+    Ok(())
+}
+
+/// Unwrap an amount of wGBM tokens into CCD
+#[receive(
+contract = "gbm_Staking",
+name = "transfer_notification",
+parameter = "OnReceivingCis2Params",
+error = "ContractError",
+)]
+fn contract_transfer_notification<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &impl HasHost<State<S>, StateApiType=S>
+) -> ContractResult<()>
+{
+    let state = host.state();
+
+    // Check that contract is not paused.
+    ensure!(state.paused, ContractError::ContractPaused);
+
+    let params: OnReceivingCis2Params<TokenIdUnit, TokenAmountU64> = ctx.parameter_cursor().get()?;
+
+    ensure!(state.token_id == params.token_id, ContractError::UnknownTokenReceived);
+
+    Ok(())
+}
+
+/// Unwrap an amount of wGBM tokens into CCD
+#[receive(
+contract = "gbm_Staking",
+name = "stake",
+parameter = "StakeParams",
+error = "ContractError",
+enable_logger,
+mutable,
+
+)]
+fn contract_stake<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &mut impl HasHost<State<S>, StateApiType=S>,
+    logger: &mut impl HasLogger,
+) -> ContractResult<()>
+{
+    // Check that contract is not paused.
+    ensure!(host.state().paused, ContractError::ContractPaused);
+
+    // Parse the parameter.
+    let params: StakeParams = ctx.parameter_cursor().get()?;
+
+    // Get the sender who invoked this contract function.
+    let sender = ctx.sender();
+
+    transfer(
+        host,
+        host.state().token,
+        host.state().token_id,
+        sender,
+        Receiver::Contract(
+            ctx.self_address(),
+            OwnedEntrypointName::new_unchecked("transfer_notification".to_string())
+        ),
+        params.amount,
+    )?;
+
+    let last_block = ctx.metadata().slot_time().timestamp_millis() / BLOCK_TIMESTAMP_DIVISOR;
+
+    let (state, builder) = host.state_and_builder();
+
+    let result = state.stake(
+        builder,
+        params.pool_id,
+        sender.clone(),
+        params.amount,
+        last_block
+    )?;
+
+    transfer(
+        host,
+        host.state().token,
+        host.state().token_id,
+        Address::Contract(ctx.self_address()),
+        match sender {
+            Address::Account(account) => Receiver::Account(account),
+            Address::Contract(contract) => Receiver::Contract(contract, OwnedEntrypointName::new_unchecked(params.owned_entrypoint_name)),
+        },
+        result,
+    )?;
+
+    // Log the deposit of tokens.
+    logger.log(&StakingEvent::Staked(StakedEvent {
+        pool_id: params.pool_id,
+        sender,
+        amount: params.amount,
+    }))?;
+
+    Ok(())
 }
 
 /// Wrap an amount of CCD into wGBM tokens and transfer the tokens if the sender
@@ -419,88 +826,29 @@ fn contract_unstake<S: HasStateApi>(
 
     ensure!(params.amount > 0, ContractError::UnstakeAmountIsZero);
 
-    // ensure!(!host.state().is_executed_withdrawal_request(&params.id), ContractError::DuplicateWithdrawRequested);
+    let last_block = ctx.metadata().slot_time().timestamp_millis() / BLOCK_TIMESTAMP_DIVISOR;
+    let result = host.state_mut().unstake(params.pool_id, sender, last_block);
 
-    // let hash = host.state().withdraw_hash(
-    //     params.id,
-    //     params.to,
-    //     params.amount,
-    //     params.expiration,
-    //     crypto_primitives,
-    // );
-    //
-    // host.state_mut().add_withdrawal_request(params.id);
+    if let Err(err) = result {
+        bail!(err);
+    }
 
-    let token = host.state().token.clone();
-
-    // let mint_parameter = MintParams {
-    //     to: params.to,
-    //     amount: params.amount,
-    // };
-    //
-    // // Let Token contract to mint tokens.
-    // host.invoke_contract(
-    //     &token,
-    //     &mint_parameter,
-    //     EntrypointName::new_unchecked("mint"),
-    //     Amount::zero(),
-    // )?;
+    transfer(
+        host,
+        host.state().token,
+        host.state().token_id,
+        Address::Contract(ctx.self_address()),
+        match sender {
+            Address::Account(account) => Receiver::Account(account),
+            Address::Contract(contract) => Receiver::Contract(contract, OwnedEntrypointName::new_unchecked(params.owned_entrypoint_name)),
+        },
+        result.ok().unwrap(),
+    )?;
 
     // Log withdrawal.
-    logger.log(&BridgeEvent::Unstaked(UnstakedEvent {
+    logger.log(&StakingEvent::Unstaked(UnstakedEvent {
         pool_id: params.pool_id,
         recipient: sender,
-        amount: params.amount,
-    }))?;
-
-    Ok(())
-}
-
-/// Unwrap an amount of wGBM tokens into CCD
-#[receive(
-contract = "gbm_Staking",
-name = "stake",
-parameter = "StakeParams",
-error = "ContractError",
-enable_logger,
-mutable
-)]
-fn contract_stake<S: HasStateApi>(
-    ctx: &impl HasReceiveContext,
-    host: &mut impl HasHost<State<S>, StateApiType=S>,
-    logger: &mut impl HasLogger,
-) -> ContractResult<()>
-{
-    // Check that contract is not paused.
-    ensure!(!host.state().paused, ContractError::ContractPaused);
-
-    // Parse the parameter.
-    let params: StakeParams = ctx.parameter_cursor().get()?;
-
-    ensure!(params.amount > 0, ContractError::StakeAmountIsZero);
-
-    // Get the sender who invoked this contract function.
-    let sender = ctx.sender();
-
-    let token = host.state().token.clone();
-
-    // let burn_parameter = BurnParams {
-    //     from: sender,
-    //     amount: params.amount,
-    // };
-    //
-    // // Let Token contract to burn tokens.
-    // host.invoke_contract(
-    //     &token,
-    //     &burn_parameter,
-    //     EntrypointName::new_unchecked("burn"),
-    //     Amount::zero(),
-    // )?;
-
-    // Log the deposit of tokens.
-    logger.log(&BridgeEvent::Staked(StakedEvent {
-        pool_id: params.pool_id,
-        sender,
         amount: params.amount,
     }))?;
 
@@ -531,26 +879,27 @@ fn contract_harvest_rewards<S: HasStateApi>(
     // Get the sender who invoked this contract function.
     let sender = ctx.sender();
 
-    let token = host.state().token.clone();
+    let last_block = ctx.metadata().slot_time().timestamp_millis() / BLOCK_TIMESTAMP_DIVISOR;
 
-    // let burn_parameter = BurnParams {
-    //     from: sender,
-    //     amount: params.amount,
-    // };
-    //
-    // // Let Token contract to burn tokens.
-    // host.invoke_contract(
-    //     &token,
-    //     &burn_parameter,
-    //     EntrypointName::new_unchecked("burn"),
-    //     Amount::zero(),
-    // )?;
+    let result = host.state_mut().harvest_rewards(params.pool_id, sender, last_block)?;
+
+    transfer(
+        host,
+        host.state().token,
+        host.state().token_id,
+        Address::Contract(ctx.self_address()),
+        match sender {
+            Address::Account(account) => Receiver::Account(account),
+            Address::Contract(contract) => Receiver::Contract(contract, OwnedEntrypointName::new_unchecked(params.owned_entrypoint_name)),
+        },
+        result,
+    )?;
 
     // Log the deposit of tokens.
-    logger.log(&BridgeEvent::HarvestedRewards(HarvestedRewardsEvent {
+    logger.log(&StakingEvent::HarvestedRewards(HarvestedRewardsEvent {
         pool_id: params.pool_id,
         recipient: sender,
-        amount: 0,
+        amount: result,
     }))?;
 
     Ok(())
@@ -567,10 +916,12 @@ error = "ContractError",
 fn contract_get_pool_staking<S: HasStateApi>(
     ctx: &impl HasReceiveContext,
     host: &impl HasHost<State<S>, StateApiType=S>,
-) -> ContractResult<(ReturnPoolStakingDetails)>
+) -> ContractResult<ReturnPoolStakingDetails>
 {
+    let state = host.state();
+
     // Check that contract is not paused.
-    ensure!(!host.state().paused, ContractError::ContractPaused);
+    ensure!(!state.paused, ContractError::ContractPaused);
 
     // Parse the parameter.
     let params: GetPoolStakingParams = ctx.parameter_cursor().get()?;
@@ -578,24 +929,19 @@ fn contract_get_pool_staking<S: HasStateApi>(
     // Get the sender who invoked this contract function.
     let sender = ctx.sender();
 
-    let token = host.state().token.clone();
+    let last_block = ctx.metadata().slot_time().timestamp_millis() / BLOCK_TIMESTAMP_DIVISOR;
 
-    // let burn_parameter = BurnParams {
-    //     from: sender,
-    //     amount: params.amount,
-    // };
-    //
-    // // Let Token contract to burn tokens.
-    // host.invoke_contract(
-    //     &token,
-    //     &burn_parameter,
-    //     EntrypointName::new_unchecked("burn"),
-    //     Amount::zero(),
-    // )?;
+    let harvestable_rewards = state.calculate_rewards_logic(
+        params.pool_id,
+        sender,
+        last_block
+    )?;
 
-    Ok(ReturnPoolStakingDetails{
-        staked_amount: 1234,
-        harvestable_rewards: 5678,
+    let pool = state.get_pool(params.pool_id).unwrap();
+
+    Ok(ReturnPoolStakingDetails {
+        staked_amount: pool.tokens_staked,
+        harvestable_rewards,
     })
 }
 
@@ -628,7 +974,7 @@ fn contract_update_admin<S: HasStateApi>(
     host.state_mut().admin = new_admin;
 
     // Log a new admin event.
-    logger.log(&BridgeEvent::NewAdmin(NewAdminEvent {
+    logger.log(&StakingEvent::NewAdmin(NewAdminEvent {
         new_admin,
     }))?;
 
@@ -906,7 +1252,7 @@ mod tests {
         claim_eq!(logger.logs.len(), 1, "Only one event should be logged");
         claim_eq!(
             logger.logs[0],
-            to_bytes(&BridgeEvent::StakedEvent(StakedEvent {
+            to_bytes(&StakingEvent::StakedEvent(StakedEvent {
                 sender: ADDRESS_0,
                 amount: deposit_params.amount,
             })),
@@ -948,7 +1294,7 @@ mod tests {
 
         // Check the event
         claim!(
-            logger.logs.contains(&to_bytes(&BridgeEvent::NewAdmin(NewAdminEvent {
+            logger.logs.contains(&to_bytes(&StakingEvent::NewAdmin(NewAdminEvent {
                 new_admin: NEW_ADMIN_ADDRESS,
             }))),
             "Missing event for the new admin"

@@ -7,6 +7,7 @@ license = "APACHE-2.0"
 
 [dependencies]
 concordium-std = "5.1"
+concordium-cis2 = {version = "3.0", default-features = false}
 
 [lib]
 crate-type=["cdylib", "rlib"]
