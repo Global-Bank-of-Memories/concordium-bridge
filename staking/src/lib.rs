@@ -1,9 +1,9 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 use std::collections::BTreeMap;
-use concordium_cis2::{AdditionalData, CIS0_STANDARD_IDENTIFIER, OnReceivingCis2Params, Receiver, StandardIdentifier, StandardIdentifierOwned, SupportResult, SupportsQueryParams, SupportsQueryResponse, TokenAmountU64, TokenIdUnit, Transfer, TransferParams};
+use concordium_cis2::{AdditionalData, CIS0_STANDARD_IDENTIFIER, Receiver, StandardIdentifier, StandardIdentifierOwned, SupportResult, SupportsQueryParams, SupportsQueryResponse, TokenAmountU64, TokenIdUnit, Transfer, TransferParams};
 use concordium_std::{*};
-use wgbm_shared::TransferParameter;
+use wgbm_shared::{OnReceivingCis2Parameter, TransferParameter};
 
 /// Tag for the NewAdmin event.
 pub const NEW_ADMIN_EVENT_TAG: u8 = 0;
@@ -706,7 +706,7 @@ fn contract_create_pool<S: HasStateApi>(
 #[receive(
 contract = "gbm_Staking",
 name = "transfer_notification",
-parameter = "OnReceivingCis2Params",
+parameter = "OnReceivingCis2Parameter",
 error = "ContractError",
 )]
 fn contract_transfer_notification<S: HasStateApi>(
@@ -719,7 +719,7 @@ fn contract_transfer_notification<S: HasStateApi>(
     // Check that contract is not paused.
     ensure!(!state.paused, ContractError::ContractPaused);
 
-    let params: OnReceivingCis2Params<TokenIdUnit, TokenAmountU64> = ctx.parameter_cursor().get()?;
+    let params: OnReceivingCis2Parameter = ctx.parameter_cursor().get()?;
 
     ensure!(state.token_id == params.token_id, ContractError::UnknownTokenReceived);
 
@@ -1298,7 +1298,7 @@ mod tests {
             host.state().token.clone(),
             EntrypointName::new_unchecked("transfer").into(),
             MockFn::new_v1(|parameter, _amount, _balance, _state: &mut State<TestStateApi>| {
-                let params: TransferParameter = match from_bytes(parameter.0) {
+                let _params: TransferParameter = match from_bytes(parameter.0) {
                     Ok(params) => params,
                     Err(_) => return Err(CallContractError::Trap),
                 };

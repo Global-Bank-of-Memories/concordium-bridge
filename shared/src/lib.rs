@@ -1,7 +1,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 use concordium_std::{SchemaType, Address, Serialize};
-use concordium_cis2::{TransferParams, TokenIdUnit, TokenAmountU64};
+use concordium_cis2::{TransferParams, OnReceivingCis2Params, TokenIdUnit, TokenAmountU64};
 
 /// Contract token ID type.
 /// Since this contract will only ever contain this one token type, we use the
@@ -13,6 +13,8 @@ pub type ContractTokenAmount = TokenAmountU64;
 
 // Contract functions required by the CIS-2 standard
 pub type TransferParameter = TransferParams<ContractTokenId, ContractTokenAmount>;
+
+pub type OnReceivingCis2Parameter = OnReceivingCis2Params<ContractTokenId, ContractTokenAmount>;
 
 /// The parameter type for the contract function `mint`.
 #[derive(Serialize, SchemaType)]
