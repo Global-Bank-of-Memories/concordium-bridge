@@ -12,8 +12,6 @@ pub const UNSTAKED_EVENT_TAG: u8 = 2;
 pub const HARVESTED_REWARDS_EVENT_TAG: u8 = 3;
 pub const CREATED_POOL_EVENT_TAG: u8 = 4;
 
-pub const REWARD_MULTIPLIER: u64 = 1000000;
-pub const BLOCK_TIMESTAMP_DIVISOR: u64 = 1000;
 
 /// List of supported standards by this contract address.
 const SUPPORTS_STANDARDS: [StandardIdentifier<'static>; 1] =
@@ -31,6 +29,8 @@ type ContractTokenId = TokenIdUnit;
 struct PoolState<S> {
     id: u32,
     reward_tokens_per_block: u64,
+    block_duration: u16,
+    rewards_multiplier: u16,
     tokens_staked: u64,
     last_rewarded_block: u64,
     accumulated_rewards_per_share: u64,
@@ -80,6 +80,8 @@ struct InitParams {
 #[derive(Serialize, SchemaType)]
 struct CreatePoolParams {
     reward_tokens_per_block: u64,
+    block_duration: u16,
+    rewards_multiplier: u16,
 }
 
 /// The parameter type for the contract function `unwrap`.
@@ -163,8 +165,9 @@ struct ReturnBasicState {
 /// The return type for the contract function `contract_get_pool_stake`.
 #[derive(Serialize, SchemaType)]
 struct ReturnPoolStakingDetails {
-    staked_amount: u64,
-    harvestable_rewards: u64,
+    pool_staked_amount: u64,
+    user_staked_amount: u64,
+    user_harvestable_rewards: u64,
 }
 
 /// The parameter type for the contract function `setPaused`.
@@ -424,12 +427,20 @@ impl<S: HasStateApi> State<S> {
         self.implementors.insert(std_id, implementors);
     }
 
-    fn create_pool(&mut self, state_builder: &mut StateBuilder<S>, reward_tokens_per_block: u64) -> u32 {
+    fn create_pool(
+        &mut self,
+        state_builder: &mut StateBuilder<S>,
+        reward_tokens_per_block: u64,
+        rewards_multiplier: u16,
+        block_duration: u16
+    ) -> u32 {
         let pool_id = self.last_pool_id;
 
         let pool = PoolState {
             id: pool_id,
             reward_tokens_per_block,
+            rewards_multiplier,
+            block_duration,
             tokens_staked: 0,
             last_rewarded_block: 0,
             accumulated_rewards_per_share: 0,
@@ -470,7 +481,7 @@ impl<S: HasStateApi> State<S> {
             let harvested_amount = Self::harvest_rewards_logic(pool, pool_staker, last_block);
 
             pool_staker.amount += amount;
-            pool_staker.reward_debt = pool_staker.amount * pool.accumulated_rewards_per_share / 1;
+            pool_staker.reward_debt = pool_staker.amount * pool.accumulated_rewards_per_share / u64::from(pool.rewards_multiplier);
 
             pool.tokens_staked += amount;
 
@@ -497,7 +508,7 @@ impl<S: HasStateApi> State<S> {
                     let amount = pool_staker.amount;
 
                     pool_staker.amount = 0;
-                    pool_staker.reward_debt = pool_staker.amount * pool.accumulated_rewards_per_share / REWARD_MULTIPLIER;
+                    pool_staker.reward_debt = pool_staker.amount * pool.accumulated_rewards_per_share / u64::from(pool.rewards_multiplier);
 
                     pool.tokens_staked -= amount;
 
@@ -555,9 +566,9 @@ impl<S: HasStateApi> State<S> {
 
                     let rewards: u64 = blocks_since_last_reward * pool.reward_tokens_per_block;
 
-                    let accumulated_rewards_per_share = pool.accumulated_rewards_per_share + (rewards * REWARD_MULTIPLIER / pool.tokens_staked);
+                    let accumulated_rewards_per_share = pool.accumulated_rewards_per_share + (rewards * u64::from(pool.rewards_multiplier) / pool.tokens_staked);
 
-                    let rewards_to_harvest: u64 = (pool_staker.amount * accumulated_rewards_per_share / REWARD_MULTIPLIER) - pool_staker.reward_debt;
+                    let rewards_to_harvest: u64 = (pool_staker.amount * accumulated_rewards_per_share / u64::from(pool.rewards_multiplier)) - pool_staker.reward_debt;
 
                     return Ok(rewards_to_harvest);
                 } else {
@@ -574,16 +585,16 @@ impl<S: HasStateApi> State<S> {
     fn harvest_rewards_logic(pool: &mut PoolState<S>, pool_staker: &mut PoolStaker, last_block: u64) -> u64 {
         Self::update_pool_rewards(pool, last_block);
 
-        let rewards_to_harvest: u64 = (pool_staker.amount * pool.accumulated_rewards_per_share / REWARD_MULTIPLIER) - pool_staker.reward_debt;
+        let rewards_to_harvest: u64 = (pool_staker.amount * pool.accumulated_rewards_per_share / u64::from(pool.rewards_multiplier)) - pool_staker.reward_debt;
 
         if rewards_to_harvest == 0 {
-            pool_staker.reward_debt = pool_staker.amount * pool.accumulated_rewards_per_share / REWARD_MULTIPLIER;
+            pool_staker.reward_debt = pool_staker.amount * pool.accumulated_rewards_per_share / u64::from(pool.rewards_multiplier);
 
             return 0;
         }
 
         pool_staker.rewards = 0;
-        pool_staker.reward_debt = pool_staker.amount * pool.accumulated_rewards_per_share / REWARD_MULTIPLIER;
+        pool_staker.reward_debt = pool_staker.amount * pool.accumulated_rewards_per_share / u64::from(pool.rewards_multiplier);
 
         return rewards_to_harvest;
     }
@@ -599,7 +610,7 @@ impl<S: HasStateApi> State<S> {
 
         let rewards: u64 = blocks_since_last_reward * pool.reward_tokens_per_block;
 
-        pool.accumulated_rewards_per_share = pool.accumulated_rewards_per_share + (rewards * REWARD_MULTIPLIER / pool.tokens_staked);
+        pool.accumulated_rewards_per_share = pool.accumulated_rewards_per_share + (rewards * u64::from(pool.rewards_multiplier) / pool.tokens_staked);
 
         pool.last_rewarded_block = last_block;
     }
@@ -692,7 +703,12 @@ fn contract_create_pool<S: HasStateApi>(
     // Parse the parameter.
     let params: CreatePoolParams = ctx.parameter_cursor().get()?;
 
-    let pool_id = state.create_pool(builder, params.reward_tokens_per_block);
+    let pool_id = state.create_pool(
+        builder,
+        params.reward_tokens_per_block,
+        params.rewards_multiplier,
+        params.block_duration,
+    );
 
     // Log withdrawal.
     logger.log(&StakingEvent::CreatedPool(PoolCreatedEvent {
@@ -763,11 +779,17 @@ fn contract_stake<S: HasStateApi>(
         params.amount,
     )?;
 
-    let last_block = ctx.metadata().slot_time().timestamp_millis() / BLOCK_TIMESTAMP_DIVISOR;
+    let pool = host.state().get_pool(params.pool_id);
+
+    if pool.is_none() {
+        return Err(ContractError::UnknownPool);
+    }
+
+    let last_block = ctx.metadata().slot_time().timestamp_millis() / u64::from(pool.unwrap().block_duration);
 
     let (state, builder) = host.state_and_builder();
 
-    let result = state.stake(
+    let calculated_rewards = state.stake(
         builder,
         params.pool_id,
         sender.clone(),
@@ -775,17 +797,19 @@ fn contract_stake<S: HasStateApi>(
         last_block
     )?;
 
-    transfer(
-        host,
-        host.state().token,
-        host.state().token_id,
-        Address::Contract(ctx.self_address()),
-        match sender {
-            Address::Account(account) => Receiver::Account(account),
-            Address::Contract(contract) => Receiver::Contract(contract, OwnedEntrypointName::new_unchecked(params.owned_entrypoint_name)),
-        },
-        result,
-    )?;
+    if calculated_rewards > 0  {
+        transfer(
+            host,
+            host.state().token,
+            host.state().token_id,
+            Address::Contract(ctx.self_address()),
+            match sender {
+                Address::Account(account) => Receiver::Account(account),
+                Address::Contract(contract) => Receiver::Contract(contract, OwnedEntrypointName::new_unchecked(params.owned_entrypoint_name)),
+            },
+            calculated_rewards,
+        )?;
+    }
 
     // Log the deposit of tokens.
     logger.log(&StakingEvent::Staked(StakedEvent {
@@ -822,7 +846,14 @@ fn contract_unstake<S: HasStateApi>(
     // Parse the parameter.
     let params: UnstakeParams = ctx.parameter_cursor().get()?;
 
-    let last_block = ctx.metadata().slot_time().timestamp_millis() / BLOCK_TIMESTAMP_DIVISOR;
+    let pool = host.state().get_pool(params.pool_id);
+
+    if pool.is_none() {
+        return Err(ContractError::UnknownPool);
+    }
+
+    let last_block = ctx.metadata().slot_time().timestamp_millis() / u64::from(pool.unwrap().block_duration);
+
     let result = host.state_mut().unstake(params.pool_id, sender, last_block)?;
 
     transfer(
@@ -875,10 +906,16 @@ fn contract_harvest_rewards<S: HasStateApi>(
     // Parse the parameter.
     let params: HarvestRewardsParams = ctx.parameter_cursor().get()?;
 
+    let pool = host.state().get_pool(params.pool_id);
+
+    if pool.is_none() {
+        return Err(ContractError::UnknownPool);
+    }
+
+    let last_block = ctx.metadata().slot_time().timestamp_millis() / u64::from(pool.unwrap().block_duration);
+
     // Get the sender who invoked this contract function.
     let sender = ctx.sender();
-
-    let last_block = ctx.metadata().slot_time().timestamp_millis() / BLOCK_TIMESTAMP_DIVISOR;
 
     let result = host.state_mut().harvest_rewards(params.pool_id, sender, last_block)?;
 
@@ -928,7 +965,13 @@ fn contract_get_pool_staking<S: HasStateApi>(
     // Get the sender who invoked this contract function.
     let sender = ctx.sender();
 
-    let last_block = ctx.metadata().slot_time().timestamp_millis() / BLOCK_TIMESTAMP_DIVISOR;
+    let pool = host.state().get_pool(params.pool_id);
+
+    if pool.is_none() {
+        return Err(ContractError::UnknownPool);
+    }
+
+    let last_block = ctx.metadata().slot_time().timestamp_millis() / u64::from(pool.unwrap().block_duration);
 
     let harvestable_rewards = state.calculate_rewards_logic(
         params.pool_id,
@@ -938,10 +981,19 @@ fn contract_get_pool_staking<S: HasStateApi>(
 
     let pool = state.get_pool(params.pool_id).unwrap();
 
-    Ok(ReturnPoolStakingDetails {
-        staked_amount: pool.tokens_staked,
-        harvestable_rewards,
-    })
+    let pool_stakers = state.pool_stakers.get(&params.pool_id).unwrap();
+
+    let pool_staker = pool_stakers.get(&sender);
+
+    if let Some(pool_staker) = pool_staker {
+        Ok(ReturnPoolStakingDetails {
+            pool_staked_amount: pool.tokens_staked,
+            user_staked_amount: pool_staker.amount,
+            user_harvestable_rewards: harvestable_rewards,
+        })
+    } else {
+        Err(ContractError::UnknownStaker)
+    }
 }
 
 /// Transfer the admin address to a new admin address.
@@ -1168,7 +1220,11 @@ mod tests {
             TOKEN_ID,
         );
 
-        state.create_pool(state_builder, 1);
+        state.create_pool(
+            state_builder, 1,
+            100,
+            1000
+        );
 
         state
     }
@@ -1272,6 +1328,83 @@ mod tests {
 
         claim_eq!(
             logger.logs[2],
+            to_bytes(&StakingEvent::HarvestedRewards(HarvestedRewardsEvent {
+                pool_id: 0,
+                recipient: ADDRESS_0,
+                amount: 864000,
+            })),
+            "Incorrect event emitted"
+        );
+
+        ///////
+        ///////
+        ///////
+        /////// Second staking
+        ///////
+        ///////
+        ///////
+
+        // Set up the parameter.
+        let stake_params = StakeParams {
+            pool_id: 0,
+            amount: 10000u64,
+            owned_entrypoint_name: "".to_string(),
+        };
+
+        let parameter_bytes = to_bytes(&stake_params);
+        ctx.set_sender(ADDRESS_0);
+        ctx.set_parameter(&parameter_bytes);
+        ctx.set_self_address(ContractAddress::new(0, 0));
+        ctx.set_metadata_slot_time(SlotTime::from_timestamp_millis((TIME_NOW + 86400 * 15) * 1000));
+
+        let result: ContractResult<()> =
+            contract_stake(&ctx, &mut host, &mut logger);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        // Check the logs.
+        claim_eq!(logger.logs.len(), 4, "Only one event should be logged");
+        claim_eq!(
+            logger.logs[3],
+            to_bytes(&StakingEvent::Staked(StakedEvent {
+                pool_id: 0,
+                sender: ADDRESS_0,
+                amount: stake_params.amount,
+            })),
+            "Incorrect event emitted"
+        );
+
+        // Set up the parameter.
+        let unstake_params = UnstakeParams {
+            pool_id: 0,
+            owned_entrypoint_name: "".to_string(),
+        };
+
+        let unstake_parameter_bytes = to_bytes(&unstake_params);
+        ctx.set_parameter(&unstake_parameter_bytes);
+        ctx.set_metadata_slot_time(SlotTime::from_timestamp_millis((TIME_NOW + 86400 * 25) * 1000));
+
+        let result: ContractResult<()> = contract_unstake(&ctx, &mut host, &mut logger);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        // Check the logs.
+        claim_eq!(logger.logs.len(), 6, "Only one event should be logged");
+
+        claim_eq!(
+            logger.logs[4],
+            to_bytes(&StakingEvent::Unstaked(UnstakedEvent {
+                pool_id: 0,
+                recipient: ADDRESS_0,
+                amount: stake_params.amount,
+            })),
+            "Incorrect event emitted"
+        );
+
+        claim_eq!(
+            logger.logs[5],
             to_bytes(&StakingEvent::HarvestedRewards(HarvestedRewardsEvent {
                 pool_id: 0,
                 recipient: ADDRESS_0,
