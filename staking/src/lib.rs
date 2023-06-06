@@ -29,7 +29,7 @@ type ContractTokenId = TokenIdUnit;
 struct PoolState<S> {
     id: u32,
     reward_tokens_per_block: u64,
-    block_duration: u16,
+    block_duration: u32,
     rewards_multiplier: u16,
     tokens_staked: u64,
     last_rewarded_block: u64,
@@ -80,7 +80,7 @@ struct InitParams {
 #[derive(Serialize, SchemaType)]
 struct CreatePoolParams {
     reward_tokens_per_block: u64,
-    block_duration: u16,
+    block_duration: u32,
     rewards_multiplier: u16,
 }
 
@@ -432,7 +432,7 @@ impl<S: HasStateApi> State<S> {
         state_builder: &mut StateBuilder<S>,
         reward_tokens_per_block: u64,
         rewards_multiplier: u16,
-        block_duration: u16
+        block_duration: u32
     ) -> u32 {
         let pool_id = self.last_pool_id;
 
