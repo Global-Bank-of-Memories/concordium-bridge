@@ -615,7 +615,7 @@ impl<S: HasStateApi> State<S> {
 
                     return Ok(rewards_to_harvest);
                 } else {
-                    return Err(ContractError::UnknownStaker);
+                    return Ok(0);
                 }
             } else {
                 return Ok(0);
@@ -1021,28 +1021,43 @@ fn contract_get_pool_staking<S: HasStateApi>(
 
     let pool = state.get_pool(params.pool_id).unwrap();
 
-    let pool_stakers = state.pool_stakers.get(&params.pool_id).unwrap();
+    let pool_stakers = state.pool_stakers.get(&params.pool_id);
 
-    let pool_staker = pool_stakers.get(&sender);
+    if let Some(pool_stakers) = pool_stakers {
+        let pool_staker = pool_stakers.get(&sender);
 
-    if let Some(pool_staker) = pool_staker {
-        Ok(ReturnPoolStakingDetails {
-            pool_staked_amount: pool.tokens_staked,
-            user_staked_amount: pool_staker.amount,
-            user_harvestable_rewards: harvestable_rewards,
+        if let Some(pool_staker) = pool_staker {
+            return Ok(ReturnPoolStakingDetails {
+                pool_staked_amount: pool.tokens_staked,
+                user_staked_amount: pool_staker.amount,
+                user_harvestable_rewards: harvestable_rewards,
 
-            reward_tokens_per_block: pool.reward_tokens_per_block,
-            block_duration: pool.block_duration,
-            rewards_multiplier: pool.rewards_multiplier,
-            min_stake_amount: pool.min_stake_amount,
-            min_blocks_unstake: pool.min_blocks_unstake,
+                reward_tokens_per_block: pool.reward_tokens_per_block,
+                block_duration: pool.block_duration,
+                rewards_multiplier: pool.rewards_multiplier,
+                min_stake_amount: pool.min_stake_amount,
+                min_blocks_unstake: pool.min_blocks_unstake,
 
-            staked_block: pool_staker.at_block,
-            staked_time: pool_staker.at_time,
-        })
-    } else {
-        Err(ContractError::UnknownStaker)
+                staked_block: pool_staker.at_block,
+                staked_time: pool_staker.at_time,
+            })
+        }
     }
+
+    Ok(ReturnPoolStakingDetails {
+        pool_staked_amount: pool.tokens_staked,
+        user_staked_amount: 0,
+        user_harvestable_rewards: harvestable_rewards,
+
+        reward_tokens_per_block: pool.reward_tokens_per_block,
+        block_duration: pool.block_duration,
+        rewards_multiplier: pool.rewards_multiplier,
+        min_stake_amount: pool.min_stake_amount,
+        min_blocks_unstake: pool.min_blocks_unstake,
+
+        staked_block: 0,
+        staked_time: 0,
+    })
 }
 
 /// Transfer the admin address to a new admin address.
@@ -1251,6 +1266,8 @@ mod tests {
     const ADDRESS_0: Address = Address::Account(ACCOUNT_0);
     const ACCOUNT_1: AccountAddress = AccountAddress([1u8; 32]);
     const ADDRESS_1: Address = Address::Account(ACCOUNT_1);
+    const ACCOUNT_2: AccountAddress = AccountAddress([2u8; 32]);
+    const ADDRESS_2: Address = Address::Account(ACCOUNT_2);
     const TIME_NOW: u64 = 1675957007;
 
     const ADMIN_ACCOUNT: AccountAddress = AccountAddress([1u8; 32]);
@@ -1553,6 +1570,126 @@ mod tests {
             })),
             "Incorrect event emitted"
         );
+    }
+
+    /// Test pool statistic.
+    #[concordium_test]
+    fn test_pool_statistics() {
+        // Set up the context.
+        let mut ctx = TestReceiveContext::empty();
+
+        let mut logger = TestLogger::init();
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        ctx.set_sender(ADDRESS_1);
+        // We are simulating reentrancy with this mock because we mutate the state.
+        host.setup_mock_entrypoint(
+            host.state().token.clone(),
+            EntrypointName::new_unchecked("transfer").into(),
+            MockFn::new_v1(|parameter, _amount, _balance, _state: &mut State<TestStateApi>| {
+                let _params: TransferParameter = match from_bytes(parameter.0) {
+                    Ok(params) => params,
+                    Err(_) => return Err(CallContractError::Trap),
+                };
+
+                Ok((true, ()))
+            }),
+        );
+
+        // Set up the parameter.
+        let stake_params = StakeParams {
+            pool_id: 0,
+            amount: 10000u64,
+            owned_entrypoint_name: "".to_string(),
+        };
+
+        let parameter_bytes = to_bytes(&stake_params);
+        ctx.set_parameter(&parameter_bytes);
+        ctx.set_self_address(ContractAddress::new(0, 0));
+        ctx.set_metadata_slot_time(SlotTime::from_timestamp_millis(TIME_NOW * 1000));
+
+        ctx.set_sender(ADDRESS_0);
+
+        let result: ContractResult<()> = contract_stake(&ctx, &mut host, &mut logger);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        // Check the logs.
+        claim_eq!(logger.logs.len(), 1, "Only one event should be logged");
+
+        claim_eq!(
+            logger.logs[0],
+            to_bytes(&StakingEvent::Staked(StakedEvent {
+                pool_id: 0,
+                sender: ADDRESS_0,
+                amount: stake_params.amount,
+                harvested_rewards: 0,
+            })),
+            "Incorrect event emitted"
+        );
+
+        // Set up the parameter.
+        let get_pool_staking_params = GetPoolStakingParams {
+            pool_id: 0,
+            address: ADDRESS_0,
+        };
+
+        let get_pool_staking_parameter_bytes = to_bytes(&get_pool_staking_params);
+        ctx.set_parameter(&get_pool_staking_parameter_bytes);
+        ctx.set_metadata_slot_time(SlotTime::from_timestamp_millis((TIME_NOW + 86400 * 10) * 1000));
+
+        let result: ContractResult<ReturnPoolStakingDetails> =
+            contract_get_pool_staking(&ctx, &host);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        // Set up the parameter.
+        let get_pool_staking_params = GetPoolStakingParams {
+            pool_id: 0,
+            address: ADDRESS_2,
+        };
+
+        let get_pool_staking_parameter_bytes = to_bytes(&get_pool_staking_params);
+        ctx.set_parameter(&get_pool_staking_parameter_bytes);
+        ctx.set_metadata_slot_time(SlotTime::from_timestamp_millis((TIME_NOW + 86400 * 10) * 1000));
+
+        let result: ContractResult<ReturnPoolStakingDetails> =
+            contract_get_pool_staking(&ctx, &host);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+    }
+
+    /// Test pool statistic.
+    #[concordium_test]
+    fn test_pool_statistics_no_staking() {
+        // Set up the context.
+        let mut ctx = TestReceiveContext::empty();
+
+        let mut logger = TestLogger::init();
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        // Set up the parameter.
+        let get_pool_staking_params = GetPoolStakingParams {
+            pool_id: 0,
+            address: ADDRESS_0,
+        };
+
+        let get_pool_staking_parameter_bytes = to_bytes(&get_pool_staking_params);
+        ctx.set_parameter(&get_pool_staking_parameter_bytes);
+        ctx.set_metadata_slot_time(SlotTime::from_timestamp_millis((TIME_NOW + 86400 * 10) * 1000));
+
+        let result: ContractResult<ReturnPoolStakingDetails> =
+            contract_get_pool_staking(&ctx, &host);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
     }
 
     /// Test admin can update to a new admin address.
