@@ -618,7 +618,7 @@ impl<S: HasStateApi> State<S> {
                     return Err(ContractError::UnknownStaker);
                 }
             } else {
-                return Err(ContractError::UnknownPool);
+                return Ok(0);
             }
         }
 
@@ -979,7 +979,7 @@ fn contract_harvest_rewards<S: HasStateApi>(
     Ok(())
 }
 
-/// Harvest an amount of wGBM tokens into CCD
+/// Get Pool staking details
 #[receive(
 contract = "gbm_Staking",
 name = "getPoolStaking",
